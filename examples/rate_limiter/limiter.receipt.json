@@ -1,0 +1,28 @@
+{
+  "schema_version": "vericoding.proof.v1",
+  "timestamp_utc": "2026-09-11T16:17:56Z",
+  "source_file": "/Users/louisfghbvc/Coding/vericoding/examples/rate_limiter/limiter.dfy",
+  "hashes": {
+    "natural_language_intent_sha256": "b05d8f2b3ac015739c0e24d2c64dce1921d9fb5218967fe3fcfa91c93b70452f",
+    "dafny_source_sha256": "5b302a38711f4dc449a8c8f24ebd6a4c6c2fe5189daa6f92961124046be36eb2",
+    "smt2_proof_sha256": "871f3304a786e9ce17a9111198ccbd2d60a791896313c635c488f0488c02b027"
+  },
+  "formal_verification": {
+    "verified": true,
+    "duration_seconds": 2.101,
+    "solver_backend": "Z3 / SMT-LIB2",
+    "errors_count": 0,
+    "diagnostics": []
+  },
+  "environment": {
+    "dafny_version": "4.11.0",
+    "z3_version": "5.1.0",
+    "platform": "darwin"
+  },
+  "proof_artifact": {
+    "smt2_file": "examples/rate_limiter/limiter.smt2",
+    "replayable": true,
+    "audit_command": "dafny verify limiter.dfy"
+  },
+  "receipt_seal_sha256": "f505ab92a47626a482b277a1e9c52aa563fb3b914afc097cd8fe204a8233d407"
+}

@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+vericoding - Unified CLI Orchestrator for the Vericoding Methodology.
+
+Pipeline Stages:
+1. env:      Check Dafny, Z3, and compilation toolchains.
+2. score:    SMT Spec Scoring and Gap Analysis.
+3. verify:   DafnyPro iterative formal verification and error diagnostics.
+4. compile:  Compile verified Dafny to Python, Go, JS, or C#.
+5. receipt:  Generate SMT-LIB2 proof artifacts and cryptographic JSON receipts.
+6. audit:    Verify an archived receipt against source code.
+7. pipeline: Run full end-to-end automated pipeline on a specification.
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+
+SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+
+def cmd_env(args):
+    import check_env
+    check_env.print_report()
+
+
+def cmd_score(args):
+    import spec_scorer
+    scorer = spec_scorer.SpecScorer(args.file)
+    res = scorer.analyze()
+    if args.json:
+        import json
+        print(json.dumps(res, indent=2))
+    else:
+        print(spec_scorer.format_cli_report(res))
+    if res["overall_score"] < args.threshold:
+        print(f"\n[Warning] Spec score ({res['overall_score']}%) below threshold ({args.threshold}%). Review recommended.", file=sys.stderr)
+
+
+def cmd_verify(args):
+    import verify_loop
+    verifier = verify_loop.DafnyVerifier()
+    res = verifier.verify(args.file, timeout_seconds=args.timeout)
+    if args.json:
+        import json
+        print(json.dumps(res, indent=2))
+    else:
+        print(verify_loop.format_cli_report(res))
+    if not res.get("verified"):
+        sys.exit(1)
+
+
+def cmd_compile(args):
+    import compiler
+    c = compiler.DafnyCompiler()
+    res = c.compile(args.file, target=args.target, output_dir=args.out)
+    if res["success"]:
+        print(f"✓ Compilation successful! Output placed in: {res['output_dir']}")
+    else:
+        print(f"✗ Compilation failed: {res.get('error')}", file=sys.stderr)
+        if res.get("raw_output"):
+            print(res["raw_output"], file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_receipt(args):
+    import receipt_generator
+    rg = receipt_generator.ReceiptGenerator()
+    res = rg.generate(args.file, nl_intent=args.intent, output_receipt_path=args.out)
+    print(f"✓ Generated cryptographic proof receipt.")
+    print(f"  Source:      {res['source_file']}")
+    print(f"  Verified:    {res['formal_verification']['verified']}")
+    print(f"  Receipt Seal:{res['receipt_seal_sha256']}")
+
+
+def cmd_audit(args):
+    import receipt_generator
+    ok = receipt_generator.verify_receipt(args.receipt)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_pipeline(args):
+    print(">>> Starting Vericoding End-to-End Pipeline <<<\n")
+    print("[1/4] Running SMT Spec Scoring & Gap Analysis...")
+    import spec_scorer
+    scorer = spec_scorer.SpecScorer(args.file)
+    res = scorer.analyze()
+    print(f"  Spec Confidence: {res['overall_score']}% [{res['confidence_level']}]")
+
+    print("\n[2/4] Running DafnyPro Formal Verification...")
+    import verify_loop
+    verifier = verify_loop.DafnyVerifier()
+    v_res = verifier.verify(args.file)
+    if not v_res.get("verified"):
+        print(f"  ✗ Verification failed! Errors: {len(v_res.get('diagnostics', []))}")
+        print(verify_loop.format_cli_report(v_res))
+        sys.exit(1)
+    print("  ✓ Formal verification succeeded!")
+
+    print(f"\n[3/4] Compiling to Target Language: {args.target}...")
+    import compiler
+    c = compiler.DafnyCompiler()
+    c_res = c.compile(args.file, target=args.target, output_dir=args.out)
+    if not c_res["success"]:
+        print(f"  ✗ Compilation failed: {c_res.get('error')}")
+        sys.exit(1)
+    print(f"  ✓ Target compiled into: {c_res['output_dir']}")
+
+    print("\n[4/4] Archiving Proof Receipt & Cryptographic Seal...")
+    import receipt_generator
+    rg = receipt_generator.ReceiptGenerator()
+    r_res = rg.generate(args.file, nl_intent=args.intent)
+    print(f"  ✓ Cryptographic Receipt Seal: {r_res['receipt_seal_sha256']}")
+    print("\n>>> Vericoding Pipeline Completed Successfully! Math, Not Vibes. <<<")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="vericoding",
+        description="Vericoding: SMT Formal Verification and LLM Code Synthesis Toolchain"
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    # env
+    p_env = sub.add_parser("env", help="Check verification and compilation toolchain environment")
+    p_env.set_defaults(func=cmd_env)
+
+    # score
+    p_score = sub.add_parser("score", help="Score Dafny specification for consistency and gaps")
+    p_score.add_argument("file", help="Path to .dfy file")
+    p_score.add_argument("--json", action="store_true", help="Output in JSON")
+    p_score.add_argument("--threshold", type=int, default=70, help="Minimum acceptable score")
+    p_score.set_defaults(func=cmd_score)
+
+    # verify
+    p_verify = sub.add_parser("verify", help="Formally verify Dafny code and extract diagnostics")
+    p_verify.add_argument("file", help="Path to .dfy file")
+    p_verify.add_argument("--json", action="store_true", help="Output in JSON")
+    p_verify.add_argument("--timeout", type=int, default=30, help="Verification timeout in seconds")
+    p_verify.set_defaults(func=cmd_verify)
+
+    # compile
+    p_compile = sub.add_parser("compile", help="Compile verified Dafny to target languages")
+    p_compile.add_argument("file", help="Path to .dfy file")
+    p_compile.add_argument("--target", default="py", help="Target language (py, go, js, cs)")
+    p_compile.add_argument("--out", default=None, help="Output directory")
+    p_compile.set_defaults(func=cmd_compile)
+
+    # receipt
+    p_receipt = sub.add_parser("receipt", help="Generate cryptographic verification receipt")
+    p_receipt.add_argument("file", help="Path to .dfy file")
+    p_receipt.add_argument("--intent", default=None, help="Natural language intent description")
+    p_receipt.add_argument("--out", default=None, help="Output receipt path")
+    p_receipt.set_defaults(func=cmd_receipt)
+
+    # audit
+    p_audit = sub.add_parser("audit", help="Audit an existing receipt against local source")
+    p_audit.add_argument("receipt", help="Path to .receipt.json file")
+    p_audit.set_defaults(func=cmd_audit)
+
+    # pipeline
+    p_pipeline = sub.add_parser("pipeline", help="Run end-to-end vericoding pipeline")
+    p_pipeline.add_argument("file", help="Path to .dfy file")
+    p_pipeline.add_argument("--target", default="py", help="Target language (py, go, js, cs)")
+    p_pipeline.add_argument("--intent", default=None, help="Natural language intent description")
+    p_pipeline.add_argument("--out", default=None, help="Output directory for compilation")
+    p_pipeline.set_defaults(func=cmd_pipeline)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

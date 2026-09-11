@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing & environments
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.venv
+env/
+venv/
+
+# Dafny build artifacts & compiled targets
+*_py/
+*_go/
+*_js/
+*_cs/
+*.dtr
+bin/Debug/
+bin/Release/
+obj/
+
+# OS files
+.DS_Store
+Thumbs.db
