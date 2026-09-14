@@ -6,6 +6,7 @@ Executes `dafny verify` and parses formal verification failures into
 structured diagnostic objects suitable for iterative LLM self-repair.
 """
 
+import io
 import os
 import re
 import sys
@@ -16,26 +17,73 @@ import subprocess
 from typing import Dict, List, Any, Optional
 
 
+# The summary line Dafny prints, which is the ONLY trustworthy source of a
+# verdict. Neither the exit code nor the presence of the string "0 errors" is
+# sufficient -- see STATUS_* below for why.
+RE_SUMMARY = re.compile(
+    r"Dafny program verifier finished with (\d+) verified, (\d+) error"
+)
+
+# Warnings that mean "this proof succeeded without establishing anything".
+# Only emitted under --analyze-proofs, and crucially they do NOT change the
+# summary line or the verified count.
+RE_VACUITY = re.compile(
+    r"Warning:.*(contradictory assumptions|was not needed to complete|redundant)",
+    re.IGNORECASE,
+)
+
+# Four outcomes, because two is not enough to describe what Dafny can do.
+#
+#   PROVED     summary present, 0 errors, no vacuity warnings
+#   FAILED     summary present, errors > 0 -- a real counterexample
+#   VACUOUS    summary says verified, but the proof rests on contradictory or
+#              unused assumptions. `requires false` lands here: the method is
+#              unreachable so ANY body verifies, including a deliberately wrong
+#              one. Dafny reports "1 verified, 0 errors" and exits 0.
+#   TOOLCHAIN  no summary line at all -- solver missing, crashed, bad args.
+#              Dafny returns exit code 4 for BOTH this and a real proof
+#              failure, and on a missing solver it prints
+#              "N resolution/type errors detected in <file>.dfy", blaming the
+#              source for a toolchain problem. Collapsing this into FAILED
+#              sends people debugging a spec that was never checked.
+STATUS_PROVED = "PROVED"
+STATUS_FAILED = "PROOF_FAILED"
+STATUS_VACUOUS = "VACUOUS_PROOF"
+STATUS_TOOLCHAIN = "TOOLCHAIN_ERROR"
+
+
 class DafnyVerifier:
     """Invokes Dafny CLI to formally verify specifications and code."""
 
-    def __init__(self, dafny_path: Optional[str] = None):
+    def __init__(self, dafny_path: Optional[str] = None, solver_path: Optional[str] = None):
         self.dafny_bin = dafny_path or shutil.which("dafny")
+        # Dafny's bundled Z3 is unusable on some hosts (e.g. it requires
+        # GLIBC_2.34, which no LD_LIBRARY_PATH can supply on an older distro).
+        # Allow an explicit solver, and honour VERICODING_Z3 so CI and
+        # constrained hosts can point at a working one without code changes.
+        self.solver_path = solver_path or os.environ.get("VERICODING_Z3")
 
     def is_available(self) -> bool:
         return bool(self.dafny_bin and os.path.exists(self.dafny_bin))
+
+    def _build_cmd(self, file_path: str) -> List[str]:
+        cmd = [self.dafny_bin, "verify", "--analyze-proofs", file_path]
+        if self.solver_path:
+            cmd.append(f"--solver-path={self.solver_path}")
+        return cmd
 
     def verify(self, file_path: str, timeout_seconds: int = 30) -> Dict[str, Any]:
         if not self.is_available():
             return {
                 "success": False,
+                "status": STATUS_TOOLCHAIN,
                 "verified": False,
                 "error": "Dafny CLI not found on system PATH. Install with: brew install dafny",
                 "diagnostics": [],
                 "raw_output": "",
             }
 
-        cmd = [self.dafny_bin, "verify", file_path]
+        cmd = self._build_cmd(file_path)
         try:
             proc = subprocess.run(
                 cmd,
@@ -45,24 +93,28 @@ class DafnyVerifier:
                 timeout=timeout_seconds,
             )
             raw_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            is_verified = (
-                proc.returncode == 0
-                and "0 errors" in raw_out
-                and ("verified, 0 errors" in raw_out or "Program has no errors" in raw_out)
-            )
-
+            status, detail = self._classify(raw_out)
             diagnostics = self._parse_diagnostics(raw_out, file_path)
 
             return {
-                "success": True,
-                "verified": is_verified,
+                "success": status != STATUS_TOOLCHAIN,
+                "status": status,
+                # `verified` stays for backwards compatibility, but it is now
+                # true ONLY for STATUS_PROVED. A vacuous proof is not a proof.
+                "verified": status == STATUS_PROVED,
                 "returncode": proc.returncode,
+                "detail": detail,
+                "vacuity_warnings": [
+                    ln.strip() for ln in raw_out.splitlines() if RE_VACUITY.search(ln)
+                ],
                 "diagnostics": diagnostics,
                 "raw_output": raw_out.strip(),
+                "error": detail if status == STATUS_TOOLCHAIN else None,
             }
         except subprocess.TimeoutExpired:
             return {
                 "success": False,
+                "status": STATUS_TOOLCHAIN,
                 "verified": False,
                 "error": f"Verification timed out after {timeout_seconds}s (potential SMT solver loop or infinite proof search)",
                 "diagnostics": [],
@@ -71,11 +123,42 @@ class DafnyVerifier:
         except Exception as ex:
             return {
                 "success": False,
+                "status": STATUS_TOOLCHAIN,
                 "verified": False,
                 "error": str(ex),
                 "diagnostics": [],
                 "raw_output": "",
             }
+
+    def _classify(self, raw_out: str) -> tuple:
+        """Derive the verdict from Dafny's output, never from its exit code."""
+        summary = RE_SUMMARY.search(raw_out)
+        if not summary:
+            hint = ""
+            if "Z3 not found" in raw_out or "solver" in raw_out.lower():
+                hint = (
+                    " The solver could not be located. Pass --solver-path or set "
+                    "VERICODING_Z3; Dafny's bundled Z3 does not run on every host."
+                )
+            return STATUS_TOOLCHAIN, (
+                "Dafny produced no verification summary, so nothing was checked."
+                + hint
+            )
+
+        verified_count, error_count = int(summary.group(1)), int(summary.group(2))
+        if error_count > 0:
+            return STATUS_FAILED, f"{verified_count} verified, {error_count} error(s)."
+
+        vacuity = [ln.strip() for ln in raw_out.splitlines() if RE_VACUITY.search(ln)]
+        if vacuity:
+            return STATUS_VACUOUS, (
+                f"{verified_count} verified with 0 errors, but {len(vacuity)} "
+                "obligation(s) were proved from contradictory or unused "
+                "assumptions. A proof that rests on an unsatisfiable premise "
+                "holds for any implementation, including a wrong one."
+            )
+
+        return STATUS_PROVED, f"{verified_count} obligation(s) proved, 0 errors."
 
     def _parse_diagnostics(self, output: str, file_path: str) -> List[Dict[str, Any]]:
         """
@@ -134,14 +217,32 @@ def format_cli_report(res: Dict[str, Any]) -> str:
     lines.append("       DAFNYPRO VERIFICATION STATUS REPORT        ")
     lines.append("==================================================")
 
-    if not res.get("success"):
-        lines.append(f"Verification Execution Failed: {res.get('error')}")
+    status = res.get("status", STATUS_TOOLCHAIN)
+
+    if status == STATUS_TOOLCHAIN:
+        lines.append("STATUS: [TOOLCHAIN ERROR] ⚙ Nothing was verified.")
+        lines.append(f"  {res.get('error') or res.get('detail')}")
+        lines.append("")
+        lines.append("  This is neither a pass nor a failure. Treating it as either")
+        lines.append("  would report on a proof that never ran.")
         lines.append("==================================================")
         return "\n".join(lines)
 
-    if res.get("verified"):
+    if status == STATUS_PROVED:
         lines.append("STATUS: [PASSED] ✓ Formal verification succeeded!")
-        lines.append("All postconditions, preconditions, and invariants mathematically proven.")
+        lines.append(f"  {res.get('detail')}")
+        lines.append("  No obligation relied on contradictory or unused assumptions.")
+
+    elif status == STATUS_VACUOUS:
+        lines.append("STATUS: [VACUOUS] ⚠ Verified, but the proof guarantees nothing.")
+        lines.append(f"  {res.get('detail')}\n")
+        for w in res.get("vacuity_warnings", []):
+            lines.append(f"  | {w}")
+        lines.append("")
+        lines.append("  Most common cause: a `requires` clause that cannot be satisfied,")
+        lines.append("  which makes the method unreachable so any body verifies.")
+        lines.append("  Fix the precondition, do not weaken the postcondition.")
+
     else:
         lines.append("STATUS: [FAILED] ✗ SMT Solver found counterexamples or unproved goals.")
         lines.append(f"Total Errors Found: {len(res.get('diagnostics', []))}\n")
@@ -159,18 +260,58 @@ def format_cli_report(res: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# Distinct exit codes so a caller (CI, the pipeline driver, a shell script) can
+# branch on the outcome without re-parsing prose.
+EXIT_CODES = {
+    STATUS_PROVED: 0,
+    STATUS_FAILED: 1,
+    STATUS_TOOLCHAIN: 2,
+    STATUS_VACUOUS: 3,
+}
+
+
+def _make_output_encoding_safe() -> None:
+    """Stop the report from crashing on an ASCII-locale host.
+
+    The report uses symbol characters, and a degraded host is exactly when the
+    TOOLCHAIN_ERROR path fires -- a broken environment often also means
+    LANG=C. Without this, the report that explains the breakage becomes a
+    second, worse breakage: a UnicodeEncodeError traceback exiting 1, which a
+    caller reads as a proof failure.
+
+    `reconfigure` is Python 3.7+; the wrapper covers 3.6, which is still the
+    system interpreter on several long-lived distributions.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        elif hasattr(stream, "buffer"):
+            setattr(sys, name, io.TextIOWrapper(
+                stream.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            ))
+
+
 def main():
     parser = argparse.ArgumentParser(description="DafnyPro Verification Runner & Diagnostic Tool")
     parser.add_argument("file_path", help="Path to .dfy file to verify")
     parser.add_argument("--json", action="store_true", help="Output diagnostics in JSON format")
     parser.add_argument("--timeout", type=int, default=30, help="Verification timeout in seconds")
+    parser.add_argument(
+        "--solver-path",
+        default=None,
+        help="Path to the z3 executable. Also read from VERICODING_Z3. "
+             "Needed wherever Dafny's bundled solver cannot run.",
+    )
     args = parser.parse_args()
+
+    _make_output_encoding_safe()
 
     if not os.path.exists(args.file_path):
         print(f"Error: file not found: {args.file_path}", file=sys.stderr)
         sys.exit(1)
 
-    verifier = DafnyVerifier()
+    verifier = DafnyVerifier(solver_path=args.solver_path)
     res = verifier.verify(args.file_path, timeout_seconds=args.timeout)
 
     if args.json:
@@ -178,8 +319,7 @@ def main():
     else:
         print(format_cli_report(res))
 
-    if not res.get("verified"):
-        sys.exit(1)
+    sys.exit(EXIT_CODES.get(res.get("status"), 2))
 
 
 if __name__ == "__main__":
