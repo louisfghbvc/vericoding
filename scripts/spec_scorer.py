@@ -23,11 +23,86 @@ except ImportError:
     z3 = None
 
 
+CLAUSE_KEYWORDS = ("requires", "ensures", "modifies", "reads", "decreases", "invariant")
+
+# One clause runs from its keyword up to the next clause keyword or the body,
+# NOT up to the next newline. A newline boundary silently truncates any clause
+# a human wrapped for readability -- `ensures y == x &&` is not a shorter
+# version of the clause, it is a broken fragment that the vacuity analysis then
+# tries to interpret.
+_CLAUSE_RE = re.compile(
+    r'\b(' + '|'.join(CLAUSE_KEYWORDS) + r')\b\s+(.*?)'
+    r'(?=\b(?:' + '|'.join(CLAUSE_KEYWORDS) + r')\b|$)',
+    re.DOTALL,
+)
+
+
+def strip_comments(text: str) -> str:
+    """Remove Dafny comments while preserving everything else's position.
+
+    This is not cosmetic. Without it the parser reads commented-out clauses as
+    real ones, and the effect runs the wrong way: adding
+
+        // ensures y > 0
+        // ensures y != -1
+
+    to a spec changed nothing about what it guarantees but moved its score from
+    70% MODERATE to 85% HIGH. Commenting a clause out increased confidence.
+
+    String and char literals are honoured so that a `//` inside one survives,
+    and block comments nest, as they do in Dafny. Newlines inside removed
+    regions are kept so that line-based reasoning elsewhere still lines up.
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+
+        if ch in '"\'':
+            quote, j = ch, i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == quote:
+                    j += 1
+                    break
+                j += 1
+            out.append(text[i:j])
+            i = j
+
+        elif text.startswith('//', i):
+            end = text.find('\n', i)
+            i = n if end == -1 else end          # keep the newline itself
+
+        elif text.startswith('/*', i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith('/*', j):
+                    depth += 1
+                    j += 2
+                elif text.startswith('*/', j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            out.append('\n' * text.count('\n', i, j))
+            i = j
+
+        else:
+            out.append(ch)
+            i += 1
+
+    return ''.join(out)
+
+
 class DafnySpecParser:
     """Extracts methods, requires, ensures, and modifies clauses from Dafny code."""
 
     def __init__(self, content: str):
-        self.content = content
+        # Comments are removed once, up front, so nothing downstream has to
+        # remember to do it.
+        self.content = strip_comments(content)
         self.methods = self._parse_methods()
 
     def _parse_methods(self) -> List[Dict[str, Any]]:
@@ -50,13 +125,16 @@ class DafnySpecParser:
             spec_block_match = re.search(r'\{', rest)
             spec_text = rest[:spec_block_match.start()] if spec_block_match else rest[:300]
 
-            # In Dafny, clauses may or may not end with semicolon, typically end of line
-            clause_pattern = re.compile(r'(requires|ensures|modifies)\s+([^{\n]+?)(?:;|\n|$)')
             requires = []
             ensures = []
             modifies = []
-            for c_match in clause_pattern.finditer(spec_text):
-                c_type, c_val = c_match.group(1), c_match.group(2).strip()
+            for c_match in _CLAUSE_RE.finditer(spec_text):
+                c_type = c_match.group(1)
+                # Collapse the wrapping a human added for readability; a clause
+                # spanning three lines is one clause, not a truncated one.
+                c_val = " ".join(c_match.group(2).split()).rstrip(";").strip()
+                if not c_val:
+                    continue
                 if c_type == "requires":
                     requires.append(c_val)
                 elif c_type == "ensures":

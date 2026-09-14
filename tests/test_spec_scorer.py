@@ -119,3 +119,92 @@ def test_scorer_rejects_unsatisfiable_antecedent(tmp_path):
     scorer = SpecScorer(str(dead_dfy))
     res = scorer.analyze()
     assert res["methods"][0]["vacuous_clauses"] == ["n < 0 ==> !ok"]
+
+
+def _clauses(src):
+    m = DafnySpecParser(src).methods
+    assert m, "parser found no methods"
+    return m[0]["requires"], m[0]["ensures"]
+
+
+def test_parser_ignores_commented_out_clauses():
+    """A commented-out clause is not a clause.
+
+    This ran the wrong way before: the parser read `// ensures ...` as real,
+    so adding two commented-out postconditions to an otherwise identical spec
+    moved its score from 70% MODERATE to 85% HIGH. Commenting a clause out
+    increased confidence in the specification.
+    """
+    requires, ensures = _clauses("""
+    method Safe(x: int) returns (y: int)
+      // ensures y > 9999
+      /* requires false */
+      requires x > 0
+      ensures y == x
+    { y := x; }
+    """)
+    assert requires == ["x > 0"]
+    assert ensures == ["y == x"]
+
+
+def test_parser_handles_nested_block_comments():
+    """Dafny block comments nest; a naive scan stops at the first `*/`."""
+    requires, ensures = _clauses("""
+    method Safe(x: int) returns (y: int)
+      /* outer /* inner ensures y > 5 */ still comment */
+      requires x > 0
+      ensures y == x
+    { y := x; }
+    """)
+    assert requires == ["x > 0"]
+    assert ensures == ["y == x"]
+
+
+def test_parser_keeps_slashes_inside_string_literals():
+    """Stripping comments must not eat a `//` that is part of the program."""
+    requires, ensures = _clauses("""
+    method Safe(x: int) returns (y: int)
+      requires x > 0
+      ensures y == x
+    { print "not // a comment"; y := x; }
+    """)
+    assert ensures == ["y == x"]
+
+
+def test_parser_joins_multi_line_clauses():
+    """A clause wrapped for readability is one clause, not a truncated one.
+
+    Terminating at the newline yielded the fragment `y == x &&`, which is not
+    a weaker version of the clause -- it is broken syntax that the vacuity
+    analysis then tried to interpret.
+    """
+    _, ensures = _clauses("""
+    method Safe(x: int) returns (y: int)
+      requires x > 0
+      ensures y == x &&
+              y > 0
+    { y := x; }
+    """)
+    assert ensures == ["y == x && y > 0"]
+
+
+def test_commenting_out_clauses_cannot_raise_the_score(tmp_path):
+    """The regression that motivated all of the above, asserted end to end."""
+    body = """
+    method Safe(x: int) returns (y: int)
+      requires x > 0
+      ensures y == x
+    {0}
+    {{ y := x; }}
+    """
+    honest = tmp_path / "honest.dfy"
+    padded = tmp_path / "padded.dfy"
+    honest.write_text(body.format(""))
+    padded.write_text(body.format("  // ensures y > 0\n      // ensures y != -1"))
+
+    honest_score = SpecScorer(str(honest)).analyze()["overall_score"]
+    padded_score = SpecScorer(str(padded)).analyze()["overall_score"]
+    assert honest_score == padded_score, (
+        "commenting clauses out changed the score: "
+        "{} vs {}".format(honest_score, padded_score)
+    )
