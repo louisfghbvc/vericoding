@@ -14,6 +14,25 @@ Pipeline Stages:
 
 import os
 import sys
+
+# Checked before anything else is imported. scripts/receipt_generator.py uses
+# the walrus operator, so on an older interpreter the first symptom is a
+# SyntaxError pointing at line 35 of a file the user did not ask about -- which
+# reads as a bug in the code rather than a mismatch with the interpreter. This
+# block is deliberately written in syntax valid all the way back to 2.7 so that
+# it is the thing that runs, not the thing that fails to parse.
+MIN_PYTHON = (3, 8)
+if sys.version_info < MIN_PYTHON:
+    sys.stderr.write(
+        "vericoding needs Python %d.%d or newer; this is %d.%d (%s).\n"
+        "The floor is set by the walrus operator in scripts/receipt_generator.py.\n"
+        "Try a newer interpreter, e.g.  python3.11 %s ...\n"
+        % (MIN_PYTHON[0], MIN_PYTHON[1],
+           sys.version_info[0], sys.version_info[1], sys.executable,
+           os.path.basename(__file__))
+    )
+    sys.exit(2)
+
 import argparse
 import subprocess
 
