@@ -66,30 +66,12 @@ class ReceiptGenerator:
         env_diag = run_diagnostics()
 
         # 2. SMT Proof Dump
-        smt_artifact_path = None
-        smt_hash = None
-        if dump_smt and self.verifier.is_available():
-            base_name = os.path.splitext(file_path)[0]
-            smt_artifact_path = f"{base_name}.smt2"
-            try:
-                # Ask Dafny to dump SMT-LIB2 queries if supported
-                dump_cmd = [
-                    self.verifier.dafny_bin,
-                    "verify",
-                    f"--solver-option:smt.dump_models=true",
-                    file_path
-                ]
-                subprocess.run(dump_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
-                # Create a standardized SMT header if file doesn't exist
-                if not os.path.exists(smt_artifact_path):
-                    with open(smt_artifact_path, "w", encoding="utf-8") as smt_f:
-                        smt_f.write(f"; SMT-LIB2 Verification Proof Artifact for {os.path.basename(file_path)}\n")
-                        smt_f.write(f"; Source SHA-256: {file_hash}\n")
-                        smt_f.write(f"; Verification Status: {'VERIFIED' if verification_result.get('verified') else 'FAILED'}\n")
-                        smt_f.write("(set-logic ALL)\n(check-sat)\n")
-                smt_hash = compute_file_sha256(smt_artifact_path)
-            except Exception:
-                pass
+        artifact = self._emit_proof_artifact(file_path) if dump_smt else {
+            "path": None, "sha256": None, "replayable": False,
+            "reason": "proof dump disabled by caller",
+        }
+        smt_artifact_path = artifact["path"]
+        smt_hash = artifact["sha256"]
 
         receipt = {
             "schema_version": "vericoding.proof.v1",
@@ -114,8 +96,18 @@ class ReceiptGenerator:
             },
             "proof_artifact": {
                 "smt2_file": smt_artifact_path,
-                "replayable": True,
-                "audit_command": f"dafny verify {os.path.basename(file_path)}"
+                # Never assert replayability we have not demonstrated. An
+                # artifact nobody has re-run is a claim, not a proof.
+                "replayable": artifact["replayable"],
+                "reason": artifact.get("reason"),
+                "assertion_count": artifact.get("assertion_count"),
+                "audit_command": (
+                    # Replay checks the ARTIFACT. `dafny verify` re-runs the
+                    # proof from source, which tells the auditor nothing about
+                    # whether the archived file contains it.
+                    f"z3 {os.path.basename(smt_artifact_path)}"
+                    if smt_artifact_path else None
+                ),
             }
         }
 
@@ -128,6 +120,101 @@ class ReceiptGenerator:
             json.dump(receipt, rf, indent=2)
 
         return receipt
+
+    # ------------------------------------------------------------------
+    # Proof artifact emission
+    # ------------------------------------------------------------------
+    #
+    # Getting a real SMT-LIB2 log out of Dafny is harder than it looks, and
+    # every failure mode here is silent:
+    #
+    #   * `--solver-option:smt.dump_models=true` dumps counterexample MODELS,
+    #     not the proof log. It writes no .smt2 file at all.
+    #   * The modern `--boogie /proverLog:F` spelling, and its `=` and quoted
+    #     variants, all report "N verified, 0 errors" and create ZERO files.
+    #   * Only the deprecated legacy CLI actually writes the log. It prints
+    #     "Warning: this way of using the CLI is deprecated." and works.
+    #
+    # Because all three of those fail quietly, the previous implementation
+    # fell back to WRITING A STUB -- a five-line file containing
+    # `(set-logic ALL)` and `(check-sat)` and no assertions whatsoever -- then
+    # hashed it and recorded `replayable: true`. That file re-checks as `sat`
+    # because an empty query is trivially satisfiable. The receipt
+    # cryptographically attested to a file containing no proof.
+    #
+    # So: emit for real, validate what came out, and when there is no artifact
+    # say so. A missing artifact is a fact worth recording. A fabricated one
+    # is worse than nothing, because it carries authority it has not earned.
+
+    MIN_ARTIFACT_BYTES = 1024
+    VALID_PREFIXES = ("(set-option", "(set-logic", "(set-info", ";")
+
+    def _emit_proof_artifact(self, file_path: str) -> Dict[str, Any]:
+        base_name = os.path.splitext(file_path)[0]
+        out_path = f"{base_name}.smt2"
+        none = {"path": None, "sha256": None, "replayable": False,
+                "assertion_count": 0}
+
+        if not self.verifier.is_available():
+            return dict(none, reason="dafny not available; no proof log emitted")
+
+        # Remove any previous artifact so a stale file can never be mistaken
+        # for output of this run.
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+        cmd = [self.verifier.dafny_bin, "/compile:0"]
+        if self.verifier.solver_path:
+            cmd.append(f"/proverOpt:PROVER_PATH={self.verifier.solver_path}")
+        cmd += [f"/proverLog:{out_path}", file_path]
+
+        try:
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=120)
+        except Exception as ex:
+            return dict(none, reason=f"proof log emission failed: {ex}")
+
+        if not os.path.exists(out_path):
+            return dict(none, reason=(
+                "dafny produced no proof log. The modern --boogie /proverLog: "
+                "spellings silently write nothing; only the legacy CLI emits one."
+            ))
+
+        content = ""
+        try:
+            with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as ex:
+            return dict(none, reason=f"proof log unreadable: {ex}")
+
+        size = len(content.encode("utf-8"))
+        assertions = content.count("(assert")
+        stripped = content.lstrip()
+
+        # A real log carries the solver's actual obligations. These three
+        # checks are cheap and each one independently rejects the stub the
+        # previous implementation used to write.
+        problems = []
+        if size < self.MIN_ARTIFACT_BYTES:
+            problems.append(f"only {size} bytes (a real log is tens of KB)")
+        if assertions == 0:
+            problems.append("contains no (assert ...) terms, so it proves nothing")
+        if not stripped.startswith(self.VALID_PREFIXES):
+            problems.append("does not begin with an SMT-LIB2 preamble")
+
+        if problems:
+            os.remove(out_path)
+            return dict(none, reason=(
+                "emitted file rejected and deleted: " + "; ".join(problems)
+            ))
+
+        return {
+            "path": out_path,
+            "sha256": compute_file_sha256(out_path),
+            "replayable": True,
+            "assertion_count": assertions,
+            "reason": None,
+        }
 
 
 def verify_receipt(receipt_file: str) -> bool:
@@ -172,8 +259,24 @@ def main():
     if args.action == "create":
         rg = ReceiptGenerator()
         res = rg.generate(args.file_path, nl_intent=args.intent, output_receipt_path=args.out)
-        print(f"✓ Receipt generated: {res.get('source_file')}.receipt.json")
+        # Print the path that was actually written. This used to append
+        # ".receipt.json" to the full source path including its extension,
+        # producing "foo.dfy.receipt.json" while generate() wrote
+        # "foo.receipt.json" -- so following the printed path hit a
+        # file-not-found on an artifact that existed.
+        written = args.out or f"{os.path.splitext(args.file_path)[0]}.receipt.json"
+        print(f"✓ Receipt generated: {written}")
         print(f"  Verified    : {res['formal_verification']['verified']}")
+
+        artifact = res["proof_artifact"]
+        if artifact["replayable"]:
+            print(f"  Proof       : {artifact['smt2_file']} "
+                  f"({artifact['assertion_count']} assertions)")
+            print(f"  Replay with : {artifact['audit_command']}")
+        else:
+            # Say it plainly. A receipt with no proof behind it is still a
+            # useful record, but only if it does not read like one that has.
+            print(f"  Proof       : NONE — {artifact['reason']}")
         print(f"  Seal SHA256 : {res['receipt_seal_sha256']}")
     elif args.action == "audit":
         ok = verify_receipt(args.receipt_path)

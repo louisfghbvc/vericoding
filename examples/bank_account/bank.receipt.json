@@ -1,28 +1,30 @@
 {
   "schema_version": "vericoding.proof.v1",
-  "timestamp_utc": "2026-09-11T16:17:20Z",
-  "source_file": "/Users/louisfghbvc/Coding/vericoding/examples/bank_account/bank.dfy",
+  "timestamp_utc": "2026-09-14T10:06:15Z",
+  "source_file": "/home/scratch.louiliu_vlsi_1/sideProject/vericoding/examples/bank_account/bank.dfy",
   "hashes": {
-    "natural_language_intent_sha256": "959ed35571e1cc1ab03047933c1fd35f9e3d4503384524f11de5e54c281925a5",
+    "natural_language_intent_sha256": "e5984b90e1a91a7972608b944cd12a724033ff00ff1084bd59dabe5c64c8312f",
     "dafny_source_sha256": "0713ac4615d59da3f4e20605e9fb26fdcf7e3711a41fa26a1fa6298316885fd5",
-    "smt2_proof_sha256": "6b2442d525c9f4e1c11a0cdd8bdb3dab1c84753da9e71ced48cfad3dce31798c"
+    "smt2_proof_sha256": "e56a53eeda4aa9ab0c70be4584371dc540635e4eaf6dae63f5c0fe462a1fdd6d"
   },
   "formal_verification": {
     "verified": true,
-    "duration_seconds": 2.252,
+    "duration_seconds": 1.284,
     "solver_backend": "Z3 / SMT-LIB2",
     "errors_count": 0,
     "diagnostics": []
   },
   "environment": {
-    "dafny_version": "4.11.0",
+    "dafny_version": "4.11.0+fcb2042d6d043a2634f0854338c08feeaaaf4ae2",
     "z3_version": "5.1.0",
-    "platform": "darwin"
+    "platform": "linux"
   },
   "proof_artifact": {
     "smt2_file": "examples/bank_account/bank.smt2",
     "replayable": true,
-    "audit_command": "dafny verify bank.dfy"
+    "reason": null,
+    "assertion_count": 294,
+    "audit_command": "z3 bank.smt2"
   },
-  "receipt_seal_sha256": "44326f2c7df1098ddefa9e9509bd4d0956c952a7859e78759b8b63fa7c0b16d7"
+  "receipt_seal_sha256": "e910c77e2de1894407fdd5d17999a594ce5b3a92a6728c23ae44766cf4d3f4f6"
 }
