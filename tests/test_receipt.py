@@ -1,9 +1,9 @@
 import os
-import pytest
+
 from scripts.receipt_generator import ReceiptGenerator, verify_receipt
 
 
-def test_receipt_generation_and_audit(tmp_path):
+def test_receipt_generation_and_audit(tmp_path, toolchain):
     rg = ReceiptGenerator()
     receipt_file = tmp_path / "test.receipt.json"
 
