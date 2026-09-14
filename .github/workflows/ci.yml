@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Verify the floor declared in pyproject.toml rather than trusting it. The
+  # floor exists because one file uses the walrus operator; a future edit could
+  # raise the real requirement without anyone noticing until a user on an older
+  # interpreter hits a SyntaxError.
+  syntax:
+    name: compile on python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: byte-compile every entry point and script
+        run: |
+          python -m py_compile bin/vericoding scripts/*.py
+      - name: CLI starts
+        run: python bin/vericoding --help > /dev/null
+
+  test:
+    name: tests with a real Dafny + Z3
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: install z3
+        # The pip wheel provides both the Python bindings and a z3 binary.
+        # Dafny's own bundled Z3 is deliberately not used: it is built against
+        # a newer glibc than several target hosts provide, so --solver-path is
+        # the supported path everywhere and CI should exercise that path.
+        run: |
+          pip install z3-solver pytest
+          echo "VERICODING_Z3=$(python -c 'import shutil; print(shutil.which("z3"))')" >> "$GITHUB_ENV"
+
+      - name: install dafny
+        run: |
+          curl -fsSL -o dafny.zip \
+            https://github.com/dafny-lang/dafny/releases/download/v4.11.0/dafny-4.11.0-x64-ubuntu-22.04.zip
+          unzip -q dafny.zip -d "$HOME/dafny-dist"
+          echo "$HOME/dafny-dist/dafny" >> "$GITHUB_PATH"
+
+      - name: toolchain reports itself
+        run: |
+          dafny --version
+          "$VERICODING_Z3" --version
+
+      # One run, two assertions. The second matters as much as the first:
+      # tests/conftest.py skips toolchain-dependent tests when no verification
+      # can run, which is right on a developer machine and wrong here -- CI
+      # installs the toolchain precisely so those tests execute. A green run
+      # full of skips would hide exactly the regressions this job exists to
+      # catch. --color=no keeps the output greppable.
+      - name: pytest, and no skips allowed once the toolchain is installed
+        run: |
+          set -o pipefail
+          pytest -q -rs --color=no 2>&1 | tee out.txt
+          if grep -qE "^SKIPPED|[0-9]+ skipped" out.txt; then
+            echo "::error::tests skipped despite an installed toolchain -- see above"
+            exit 1
+          fi
+
+      # The defect this repo shipped with was a FABRICATED proof artifact: a
+      # five-line stub containing (set-logic ALL) and (check-sat), no
+      # assertions, hashed into the receipt and recorded as replayable. It
+      # re-checked as `sat` because an empty query is trivially satisfiable.
+      #
+      # This step makes that specific regression impossible to reintroduce
+      # unnoticed: regenerate each example's artifact and require the solver to
+      # answer unsat on it. A stub cannot pass.
+      - name: proof artifacts are real and replay as unsat
+        run: |
+          set -euo pipefail
+          for dfy in examples/*/*.dfy; do
+            base="${dfy%.dfy}"
+            python bin/vericoding receipt "$dfy"
+            test -f "$base.smt2" || { echo "::error::no artifact for $dfy"; exit 1; }
+            n=$(grep -c '(assert' "$base.smt2")
+            if [ "$n" -lt 1 ]; then
+              echo "::error::$base.smt2 has no assertions -- it proves nothing"
+              exit 1
+            fi
+            result=$("$VERICODING_Z3" "$base.smt2" | head -1)
+            echo "$base.smt2: $n assertions, z3 says $result"
+            if [ "$result" != "unsat" ]; then
+              echo "::error::$base.smt2 did not replay as unsat (got $result)"
+              exit 1
+            fi
+          done
+
+      # Committed artifacts should match what the toolchain produces. Drift
+      # means the repo is shipping a proof of something other than the spec
+      # beside it.
+      - name: committed artifacts match a fresh run
+        run: |
+          if ! git diff --quiet -- 'examples/**/*.smt2'; then
+            echo "::error::committed .smt2 artifacts differ from a fresh generation"
+            git diff --stat -- 'examples/**/*.smt2'
+            exit 1
+          fi
