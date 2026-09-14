@@ -217,29 +217,103 @@ class ReceiptGenerator:
         }
 
 
+def recompute_seal(data: Dict[str, Any]) -> str:
+    """Recompute a receipt's seal exactly as `generate` produced it.
+
+    The seal covers the receipt with the seal key itself removed, so this must
+    mirror generate()'s ordering or every receipt will look tampered with.
+    """
+    body = {k: v for k, v in data.items() if k != "receipt_seal_sha256"}
+    return compute_sha256(json.dumps(body, sort_keys=True))
+
+
 def verify_receipt(receipt_file: str) -> bool:
-    """Verifies that an archived receipt accurately reflects the local code and verification state."""
+    """Check that a receipt still describes the code and the proof beside it.
+
+    Every line this prints corresponds to something that was checked. That is
+    not a stylistic preference -- the previous version printed three green
+    checkmarks while validating exactly one thing:
+
+      * "Receipt Seal: <hash>" printed the stored seal without recomputing it,
+        so replacing it with 64 zeros produced a green line and exit 0.
+      * The proof artifact was never examined, so corrupting
+        hashes.smt2_proof_sha256 also passed.
+
+    A receipt is a claim about three artifacts -- the source, the proof, and
+    itself. Checking one of them and reporting on three is the same defect the
+    stub proof artifact was: authority that has not been earned.
+    """
     with open(receipt_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    checks, failures = [], []
+
+    # 1. The receipt has not been edited since it was issued.
+    stored_seal = data.get("receipt_seal_sha256")
+    if not stored_seal:
+        failures.append("receipt carries no seal")
+    else:
+        actual_seal = recompute_seal(data)
+        if actual_seal != stored_seal:
+            failures.append(
+                "receipt seal mismatch -- the receipt was edited after issuance\n"
+                "    recorded: {}\n    actual  : {}".format(stored_seal, actual_seal)
+            )
+        else:
+            checks.append("Receipt seal intact ({}...)".format(stored_seal[:16]))
+
+    # 2. The source still hashes to what was verified.
     source_file = data.get("source_file")
+    expected_source = data.get("hashes", {}).get("dafny_source_sha256")
     if not source_file or not os.path.exists(source_file):
-        print(f"✗ Source file not found: {source_file}")
-        return False
+        failures.append("source file not found: {}".format(source_file))
+    else:
+        current = compute_file_sha256(source_file)
+        if current != expected_source:
+            failures.append(
+                "source changed since issuance\n"
+                "    recorded: {}\n    actual  : {}".format(expected_source, current)
+            )
+        else:
+            checks.append("Source matches ({}...)".format(current[:12]))
 
-    current_hash = compute_file_sha256(source_file)
-    expected_hash = data.get("hashes", {}).get("dafny_source_sha256")
+    # 3. The proof artifact, if the receipt claims one, is the one it claims.
+    artifact = data.get("proof_artifact") or {}
+    smt2_path = artifact.get("smt2_file")
+    recorded_proof = data.get("hashes", {}).get("smt2_proof_sha256")
+    if not smt2_path:
+        # Not a failure. A receipt that honestly records having no proof is
+        # still a valid receipt -- it just cannot claim a verified artifact.
+        checks.append(
+            "No proof artifact claimed ({})".format(
+                artifact.get("reason") or "reason not recorded"
+            )
+        )
+    elif not os.path.exists(smt2_path):
+        failures.append("receipt names a proof artifact that is missing: {}".format(smt2_path))
+    else:
+        actual_proof = compute_file_sha256(smt2_path)
+        if actual_proof != recorded_proof:
+            failures.append(
+                "proof artifact changed since issuance: {}\n"
+                "    recorded: {}\n    actual  : {}".format(
+                    smt2_path, recorded_proof, actual_proof)
+            )
+        else:
+            checks.append("Proof artifact matches ({}...)".format(actual_proof[:12]))
 
-    if current_hash != expected_hash:
-        print(f"✗ Cryptographic Hash Mismatch!")
-        print(f"  Expected: {expected_hash}")
-        print(f"  Actual  : {current_hash}")
-        return False
+    for line in checks:
+        print("✓ {}".format(line))
+    for line in failures:
+        print("✗ {}".format(line))
 
-    print(f"✓ Source integrity verified (SHA-256 matches: {current_hash[:12]}...)")
-    print(f"✓ Verification status at issuance: {'VERIFIED' if data['formal_verification']['verified'] else 'FAILED'}")
-    print(f"✓ Receipt Seal: {data.get('receipt_seal_sha256', 'N/A')[:16]}...")
-    return True
+    # Reported last so it cannot be mistaken for a check. It is a record of what
+    # the verifier said at issuance, not something this command re-establishes.
+    status = data.get("formal_verification", {}).get("verified")
+    print("  status at issuance: {} (recorded, not re-verified here)".format(
+        "VERIFIED" if status else "NOT VERIFIED"))
+
+    return not failures
 
 
 def main():
