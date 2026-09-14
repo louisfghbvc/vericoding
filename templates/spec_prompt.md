@@ -14,8 +14,15 @@ Your task is to translate natural language user intent and requirements into rig
    - **Failure / Error Path**: If an operation fails, explicitly guarantee state preservation (`ensures !success ==> balance == old(balance)`).
 4. **Frame Conditions (`modifies`)**:
    - Specify exactly which heap objects may be mutated.
-5. **Separation of Concerns**:
-   - In the `spec` phase, declare the method signature and contract **without** writing the complex implementation body, or leave it as a method stub with `assume false;` or empty block for pure contract auditing.
+5. **Every clause must be able to fire (no vacuity)**:
+   - Before writing a clause, ask whether its antecedent can ever hold. Under `requires n >= 0`, the clause `ensures n < 0 ==> !ok` is unreachable: it verifies instantly and protects nothing.
+   - Never write `ensures <anything> ==> true`, or `ensures true`. These are satisfied by every implementation.
+   - Never write `requires false`, and never write `assume false;` or `assert false;` in a body. Each one makes the method unreachable, so the proof succeeds against *any* implementation — including a catastrophically wrong one. A verifier will report "verified, 0 errors" and you will have guaranteed nothing.
+   - More clauses is not better. One clause that can fire is worth more than five that cannot.
+
+6. **Separation of Concerns**:
+   - In the `spec` phase, declare the method signature and contract **without** writing the implementation body.
+   - For a pure contract stub, leave the body **empty** — do not use `assume false;`. An empty body is honest about being unimplemented; `assume false;` silently makes the contract unfalsifiable.
 
 ## Example Dafny Spec Pattern
 ```dafny
