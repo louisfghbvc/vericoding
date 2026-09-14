@@ -208,3 +208,54 @@ def test_commenting_out_clauses_cannot_raise_the_score(tmp_path):
         "commenting clauses out changed the score: "
         "{} vs {}".format(honest_score, padded_score)
     )
+
+
+def test_scorer_rejects_assume_false_in_the_body(tmp_path):
+    """Body-level vacuity, which the clause analysis alone cannot see.
+
+    `assume false;` makes everything after it unreachable, so every
+    postcondition holds for any implementation. Before this check the scorer
+    read only clauses and reported 85% HIGH on exactly this spec -- including
+    the line "Preconditions are jointly satisfiable (no Shape-A vacuity)",
+    which was true and beside the point.
+
+    It matters most here rather than in the verifier: `score` is the stage a
+    human uses to decide whether to approve a specification.
+    """
+    dfy = tmp_path / "assume_false.dfy"
+    dfy.write_text("""
+    method Withdraw(amount: int, balance: int) returns (success: bool, newBalance: int)
+      requires amount > 0
+      ensures success ==> newBalance == balance - amount
+      ensures !success ==> newBalance == balance
+      ensures newBalance >= 0
+    {
+      assume false;
+      success := true;
+      newBalance := -99999;
+    }
+    """)
+    res = SpecScorer(str(dfy)).analyze()
+    assert res["overall_score"] == 0
+    gaps = res["methods"][0]["gaps"]
+    assert any(g["category"] == "Body Vacuity" for g in gaps)
+
+
+def test_scorer_allows_an_empty_contract_stub(tmp_path):
+    """An empty body is a legitimate way to declare a contract for auditing.
+
+    The point of the check above is `assume false`, not "has no
+    implementation" -- flagging the stub form too would push authors straight
+    back to the vacuous one.
+    """
+    dfy = tmp_path / "stub.dfy"
+    dfy.write_text("""
+    method Withdraw(amount: int, balance: int) returns (success: bool, newBalance: int)
+      requires amount > 0
+      ensures success ==> newBalance == balance - amount
+      ensures !success ==> newBalance == balance
+      ensures newBalance >= 0
+    """)
+    res = SpecScorer(str(dfy)).analyze()
+    assert res["overall_score"] >= 80
+    assert not any(g["category"] == "Body Vacuity" for g in res["methods"][0]["gaps"])

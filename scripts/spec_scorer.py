@@ -150,8 +150,28 @@ class DafnySpecParser:
                 "requires": [r.strip() for r in requires],
                 "ensures": [e.strip() for e in ensures],
                 "modifies": [m.strip() for m in modifies],
+                # The body is captured because vacuity can live there too, not
+                # only in the clauses -- see BODY_VACUITY_RE below.
+                "body": self._extract_body(rest, spec_block_match),
             })
         return methods
+
+    @staticmethod
+    def _extract_body(rest: str, spec_block_match) -> str:
+        """Return the method body, brace-balanced, or '' if there is none."""
+        if not spec_block_match:
+            return ""
+        start = spec_block_match.start()
+        depth, i = 0, start
+        while i < len(rest):
+            if rest[i] == "{":
+                depth += 1
+            elif rest[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return rest[start + 1:i]
+            i += 1
+        return rest[start + 1:]
 
 
 class SpecScorer:
@@ -202,6 +222,34 @@ class SpecScorer:
         gaps = []
         strengths = []
         score = 50  # baseline
+
+        # Body-level vacuity, checked first because it makes every clause
+        # below meaningless no matter how well written they are. `assume
+        # false;` renders the rest of the method unreachable, so every
+        # postcondition verifies against any implementation -- and the scorer
+        # used to miss it entirely, because it only ever read clauses. A spec
+        # with `assume false;` and a deliberately wrong body scored 85% HIGH
+        # and was told its preconditions were free of vacuity.
+        #
+        # This matters most here rather than in verify_loop: `score` is the
+        # stage a human uses to decide whether to approve a specification.
+        body_vacuity = self._check_body_vacuity(method)
+        if body_vacuity:
+            return {
+                "method_name": method["name"],
+                "score": 0,
+                "strengths": [],
+                "gaps": [{
+                    "category": "Body Vacuity",
+                    "status": "VACUOUS",
+                    "message": body_vacuity,
+                }],
+                "raw_requires": method["requires"],
+                "raw_ensures": method["ensures"],
+                "live_ensures": [],
+                "vacuous_clauses": list(method["ensures"]),
+                "unanalysed_clauses": [],
+            }
 
         # Vacuity first, because it decides what the other counts MEAN. The
         # original scoring counted every `ensures` as evidence of rigour, which
@@ -461,6 +509,26 @@ class SpecScorer:
             else:
                 terms.append(atom)
         return terms, unparsed
+
+    # `assume false` is the body-level equivalent of `requires false`: it makes
+    # everything after it unreachable, so every postcondition holds for any
+    # implementation. `assert false` reaches the same state by a different
+    # route. Both are legitimate mid-proof tools in narrow cases, which is
+    # exactly why they need to be surfaced rather than silently tolerated in a
+    # specification a human is about to approve.
+    BODY_VACUITY_RE = re.compile(r'\b(assume|assert)\s+false\s*;')
+
+    def _check_body_vacuity(self, method: Dict[str, Any]):
+        """Return a message if the body makes the contract unfalsifiable."""
+        match = self.BODY_VACUITY_RE.search(method.get("body", "") or "")
+        if not match:
+            return None
+        return (
+            "`{}` in the body makes everything after it unreachable, so every "
+            "postcondition above holds for ANY implementation -- including a "
+            "wrong one. The proof will succeed and guarantee nothing. If this "
+            "is a contract stub, leave the body empty instead."
+        ).format(match.group(0))
 
     def _check_smt_vacuity(self, method: Dict[str, Any]) -> Dict[str, Any]:
         """Shape A: are the preconditions jointly satisfiable?"""
