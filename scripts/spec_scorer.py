@@ -363,9 +363,22 @@ class SpecScorer:
             })
             score -= 20
 
-        # 2c. Anything the analyser could not read is reported, never credited.
-        # Scoring an unread clause as sound is the same mistake this tool
-        # exists to catch.
+        # 2c. Anything the analyser could not read is reported, never credited,
+        # and costs exactly what a vacuous clause costs.
+        #
+        # Not crediting it is not enough. Vacuous was -20 and unanalysed was 0,
+        # so ANY failure to read a clause was worth 20 points more than reading
+        # it and finding it hollow -- and the cheapest way to get there is for
+        # the solver to fall over. Measured on a spec with one vacuous
+        # postcondition: 15 with a working z3, 30 with a broken one. Breaking
+        # the analyser improved the score.
+        #
+        # On the evidence available, an unanalysed clause is indistinguishable
+        # from a vacuous one; that is what "not analysed" means. Scoring it as
+        # the better of the two possibilities is a claim the check did not
+        # earn. The gap list still distinguishes NOT ANALYSED from VACUOUS, so
+        # a human reviewer sees which is which -- but the number that feeds the
+        # gate does not improve because the tool went blind.
         for u in unanalysed_ensures:
             clause = u["clause"] if isinstance(u, dict) else u
             why = u.get("why", "") if isinstance(u, dict) else ""
@@ -374,6 +387,7 @@ class SpecScorer:
                 "status": "NOT ANALYSED",
                 "message": f"`{clause}` was not checked for vacuity" + (f" — {why}" if why else "")
             })
+            score -= 20
 
         # 3. Check failure branch handling. Only live clauses count -- a
         # vacuous clause mentioning "fail" is not failure coverage.
@@ -558,12 +572,11 @@ class SpecScorer:
         parts = [_unwrap_parens(p) for p in re.split(r'&&', text) if p.strip()]
         terms, unparsed = [], []
         for part in parts:
-            low = part.strip().lower()
-            if low in self.TRIVIALLY_TRUE:
-                continue
-            if low in self.TRIVIALLY_FALSE:
-                terms.append(z3.BoolVal(False))
-                continue
+            # Literals are `_atom`'s job now. Keeping a second copy of the
+            # rule here is what let `!true` slip between them: this loop
+            # matched only the bare spellings and `_atom` deferred to this
+            # loop, so the negated form belonged to neither. One place
+            # understands literals.
             atom = self._atom(part, var_map, bool_map)
             if atom is None:
                 unparsed.append(part)
