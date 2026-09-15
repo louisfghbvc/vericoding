@@ -101,8 +101,16 @@ def cmd_receipt(args):
 
 def cmd_audit(args):
     import receipt_generator
-    ok = receipt_generator.verify_receipt(args.receipt)
-    sys.exit(0 if ok else 1)
+    result = receipt_generator.audit_receipt(args.receipt, replay=not args.no_replay)
+    # Three outcomes, for the same reason the verifier has four: "every check
+    # passed" and "a check could not be run" are different facts, and
+    # collapsing them into exit 0 is how an unverified proof comes to look
+    # like a verified one.
+    if result["failures"]:
+        sys.exit(1)
+    if result["notes"]:
+        sys.exit(2)
+    sys.exit(0)
 
 
 # Below this the specification is, by the scorer's own label, LOW confidence.
@@ -241,6 +249,11 @@ def main():
     # audit
     p_audit = sub.add_parser("audit", help="Audit an existing receipt against local source")
     p_audit.add_argument("receipt", help="Path to .receipt.json file")
+    p_audit.add_argument(
+        "--no-replay", action="store_true",
+        help="skip re-running the archived proof through the solver "
+             "(hashes are still checked; the proof is then unverified here)",
+    )
     p_audit.set_defaults(func=cmd_audit)
 
     # pipeline

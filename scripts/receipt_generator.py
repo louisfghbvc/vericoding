@@ -13,6 +13,7 @@ import sys
 import json
 import time
 import hashlib
+import shutil
 import argparse
 import subprocess
 from typing import Dict, Any, Optional
@@ -23,6 +24,10 @@ try:
 except ImportError:
     from scripts.verify_loop import DafnyVerifier
     from scripts.check_env import run_diagnostics
+
+
+# Generous: a real Dafny proof log is tens of thousands of assertions.
+REPLAY_TIMEOUT_S = 300
 
 
 def compute_sha256(content: str) -> str:
@@ -234,7 +239,58 @@ def recompute_seal(data: Dict[str, Any]) -> str:
     return compute_sha256(json.dumps(body, sort_keys=True))
 
 
-def verify_receipt(receipt_file: str) -> bool:
+def replay_proof(smt2_path: str, solver_path: Optional[str] = None) -> Dict[str, Any]:
+    """Re-run the archived proof through a solver.
+
+    This is the property the whole method rests on: the artifact is portable
+    SMT-LIB2, so anyone can check it without trusting this pipeline, this
+    machine, or the model that wrote the code. Until something actually runs
+    it, "replayable: true" is a claim about a file nobody has opened.
+
+    A genuine Dafny proof log asks the solver to refute the negation of each
+    obligation, so every `(check-sat)` must answer `unsat`. A single `sat`
+    means an obligation was satisfiable in its negated form -- the proof does
+    not hold. The stub this generator used to fabricate answers `sat` for a
+    different reason (an empty query is trivially satisfiable), and is caught
+    by the same check.
+    """
+    solver = solver_path or os.environ.get("VERICODING_Z3") or shutil.which("z3")
+    if not solver:
+        return {"checked": False, "reason": "no z3 on PATH and VERICODING_Z3 unset"}
+    if not os.path.exists(smt2_path):
+        return {"checked": False, "reason": f"artifact missing: {smt2_path}"}
+
+    try:
+        proc = subprocess.run(
+            [solver, smt2_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=REPLAY_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return {"checked": False, "reason": f"solver timed out after {REPLAY_TIMEOUT_S}s"}
+    except Exception as ex:
+        return {"checked": False, "reason": str(ex)}
+
+    answers = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    verdicts = [a for a in answers if a in ("sat", "unsat", "unknown")]
+    if not verdicts:
+        return {"checked": False, "reason": "solver produced no sat/unsat answer"}
+
+    bad = [v for v in verdicts if v != "unsat"]
+    return {
+        "checked": True,
+        "ok": not bad,
+        "checks": len(verdicts),
+        "solver": solver,
+        "reason": None if not bad else (
+            "{} of {} obligation(s) did not discharge: {}".format(
+                len(bad), len(verdicts), ", ".join(sorted(set(bad)))
+            )
+        ),
+    }
+
+
+def audit_receipt(receipt_file: str, replay: bool = True) -> Dict[str, Any]:
     """Check that a receipt still describes the code and the proof beside it.
 
     Every line this prints corresponds to something that was checked. That is
@@ -253,7 +309,7 @@ def verify_receipt(receipt_file: str) -> bool:
     with open(receipt_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    checks, failures = [], []
+    checks, failures, notes = [], [], []
 
     # 1. The receipt has not been edited since it was issued.
     stored_seal = data.get("receipt_seal_sha256")
@@ -309,8 +365,32 @@ def verify_receipt(receipt_file: str) -> bool:
         else:
             checks.append("Proof artifact matches ({}...)".format(actual_proof[:12]))
 
+            # A matching hash says the file is the one that was archived. It
+            # says nothing about whether the proof in it holds -- the hash of
+            # a fabricated stub matches itself perfectly well. Re-running it
+            # is the only thing that distinguishes an archived proof from an
+            # archived file.
+            if replay:
+                result = replay_proof(smt2_path)
+                if not result.get("checked"):
+                    notes.append(
+                        "proof not replayed ({}). The artifact's hash matches, "
+                        "but nothing here re-established that it holds.".format(
+                            result.get("reason"))
+                    )
+                elif result["ok"]:
+                    checks.append(
+                        "Proof replays: {} obligation(s), all unsat".format(result["checks"])
+                    )
+                else:
+                    failures.append("proof does NOT replay -- " + result["reason"])
+
     for line in checks:
         print("✓ {}".format(line))
+    for line in notes:
+        # Neither a pass nor a failure: something could not be checked here.
+        # Printing it as either would be the mistake this tool exists to avoid.
+        print("? {}".format(line))
     for line in failures:
         print("✗ {}".format(line))
 
@@ -320,7 +400,12 @@ def verify_receipt(receipt_file: str) -> bool:
     print("  status at issuance: {} (recorded, not re-verified here)".format(
         "VERIFIED" if status else "NOT VERIFIED"))
 
-    return not failures
+    return {"passed": not failures, "checks": checks, "failures": failures, "notes": notes}
+
+
+def verify_receipt(receipt_file: str, replay: bool = True) -> bool:
+    """Boolean form, for callers that only need pass/fail."""
+    return audit_receipt(receipt_file, replay=replay)["passed"]
 
 
 def main():
