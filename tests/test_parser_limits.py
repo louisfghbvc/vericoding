@@ -272,3 +272,79 @@ def test_a_plain_postcondition_needs_no_solver_to_be_live(tmp_path, monkeypatch)
     { y := x; }
     """, monkeypatch)
     assert res["methods"][0]["live_ensures"] == ["y == x"]
+
+
+# --- parenthesised and negated-literal preconditions --------------------
+
+def _statuses(tmp_path, requires):
+    src = ("method M(x: int, y: int) returns (r: int)\n"
+           "  requires %s\n  ensures r == x\n{ r := x; }\n" % requires)
+    return [g["status"] for g in _analyse(tmp_path, src)["gaps"]]
+
+
+@pytest.mark.parametrize("requires", [
+    "(x > 0) && (x < 5)",
+    "(x > 0) && (x < 5) && (y > 1)",
+    "((x > 0)) && ((x < 5))",
+    "(x > 0 && x < 5)",
+])
+def test_parenthesised_conjuncts_are_analysed(tmp_path, requires):
+    """Idiomatic Dafny, previously unreadable.
+
+    The paren-stripper counted parens instead of matching them. For
+    `(x > 0) && (x < 5)` the counts match, the string starts with `(` and ends
+    with `)`, and the inner slice `x > 0) && (x < 5` has matching counts too --
+    so it stripped, twice, and handed the splitter mangled text. Both conjuncts
+    then failed to parse and the clause came back NOT ANALYSED.
+    """
+    assert "NOT ANALYSED" not in _statuses(tmp_path, requires)
+
+
+def test_a_contradiction_hidden_behind_parentheses_is_found(tmp_path):
+    """What the parser bug actually cost.
+
+    These preconditions have no common solution, so the method is unreachable
+    and any body verifies -- textbook Shape A. Because the clause did not
+    parse, the scorer reported NOT ANALYSED and scored it 65 instead of 0.
+    An unreadable clause is not a neutral outcome; it silently disables the
+    check that clause was there to feed.
+    """
+    assert "CONTRADICTION" in _statuses(tmp_path, "(x > 10) && (x < 5)")
+
+
+def test_a_negated_true_is_recognised_as_false(tmp_path):
+    """`requires !true` is `requires false` wearing a hat.
+
+    Literal handling lived in `_conjunction`, which only ever matched the bare
+    forms, so `!true` fell through to `_atom` and came back unparsed: NOT
+    ANALYSED, score 65, while the identical `requires false` scored 0.
+    """
+    assert "CONTRADICTION" in _statuses(tmp_path, "!true")
+    assert "CONTRADICTION" in _statuses(tmp_path, "x > 0 && !true")
+
+
+def test_a_negated_false_does_not_poison_a_good_precondition(tmp_path):
+    """The mirror direction. `!false` is simply true, and must not be mistaken
+    for a contradiction now that the negation is understood."""
+    statuses = _statuses(tmp_path, "!false && x > 0")
+    assert "CONTRADICTION" not in statuses
+    assert "NOT ANALYSED" not in statuses
+
+
+def test_unwrapping_still_refuses_what_it_cannot_read(tmp_path):
+    """The relaxation must not turn into permissiveness: an uninterpreted
+    predicate is still reported, not quietly assumed."""
+    assert "NOT ANALYSED" in _statuses(tmp_path, "Valid(x)")
+
+
+@pytest.mark.parametrize("text,wraps", [
+    ("(a && b)", True),
+    ("(a) && (b)", False),
+    ("((a))", True),
+    ("(a) && (b) && (c)", False),
+    ("(a && (b)) ", True),
+    ("a && b", False),
+])
+def test_wraps_whole_matches_rather_than_counts(text, wraps):
+    from scripts.spec_scorer import _wraps_whole
+    assert _wraps_whole(text.strip()) is wraps

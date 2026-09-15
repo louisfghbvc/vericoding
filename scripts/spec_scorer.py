@@ -96,6 +96,32 @@ def strip_comments(text: str) -> str:
     return ''.join(out)
 
 
+def _wraps_whole(text: str) -> bool:
+    """True when the leading `(` is closed by the trailing `)`.
+
+    `(a) && (b)` is balanced and starts and ends with parens, but the first
+    one closes in the middle -- stripping them yields `a) && (b`. Only a scan
+    distinguishes that from `(a && b)`.
+    """
+    depth = 0
+    for index, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return index == len(text) - 1
+    return False
+
+
+def _unwrap_parens(text: str) -> str:
+    """Remove parentheses that wrap the whole expression, however many."""
+    text = text.strip()
+    while text.startswith("(") and text.endswith(")") and _wraps_whole(text):
+        text = text[1:-1].strip()
+    return text
+
+
 class DafnySpecParser:
     """Extracts methods, requires, ensures, and modifies clauses from Dafny code."""
 
@@ -495,8 +521,16 @@ class SpecScorer:
         bool_match = self.RE_BOOL_ATOM.match(text)
         if bool_match:
             negated, name = bool_match.groups()
-            if name.lower() in self.TRIVIALLY_TRUE or name.lower() in self.TRIVIALLY_FALSE:
-                return None  # handled by the caller's literal checks
+            low = name.lower()
+            # Literals are translated here rather than deferred to the caller.
+            # Deferring meant the caller's checks -- which only ever saw the
+            # bare forms -- let `!true` through as unparsed, so `requires
+            # !true` was reported NOT ANALYSED and scored 65 while the
+            # identical `requires false` scored 0. A negation is not a reason
+            # to stop understanding a literal.
+            if low in self.TRIVIALLY_TRUE or low in self.TRIVIALLY_FALSE:
+                value = low in self.TRIVIALLY_TRUE
+                return z3.BoolVal(not value if negated else value)
             var = bool_map.setdefault(name, z3.Bool(name))
             return z3.Not(var) if negated else var
 
@@ -505,15 +539,23 @@ class SpecScorer:
     def _conjunction(self, text: str, var_map: Dict[str, Any],
                      bool_map: Dict[str, Any]):
         """Translate `a && b && c`, returning (terms, unparsed_parts)."""
-        # Strip one layer of wrapping parentheses so `(a && b)` parses.
-        text = text.strip()
-        while text.startswith("(") and text.endswith(")") and text.count("(") == text.count(")"):
-            inner = text[1:-1].strip()
-            if inner.count("(") != inner.count(")"):
-                break
-            text = inner
+        # Strip wrapping parentheses so `(a && b)` parses.
+        #
+        # Counting parens cannot do this. For `(x > 0) && (x < 5)` the counts
+        # match, the string starts with "(" and ends with ")", and the inner
+        # slice `x > 0) && (x < 5` ALSO has matching counts -- so the old
+        # check passed twice over and handed the splitter mangled text. Both
+        # conjuncts then failed to parse and an entirely idiomatic Dafny
+        # precondition came back NOT ANALYSED, taking the Shape-A check with
+        # it. The question is not "are the parens balanced" but "does the
+        # FIRST one close at the very end", which needs a scan.
+        text = _unwrap_parens(text)
 
-        parts = [p.strip() for p in re.split(r'&&', text) if p.strip()]
+        # And again per conjunct: declining to strip `(a) && (b)` as a whole is
+        # correct, but it leaves each conjunct wearing its own parens, which
+        # `_atom` cannot read either. Unwrapping only the outside fixed the
+        # mangling and left the clause just as unanalysed.
+        parts = [_unwrap_parens(p) for p in re.split(r'&&', text) if p.strip()]
         terms, unparsed = [], []
         for part in parts:
             low = part.strip().lower()
