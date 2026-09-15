@@ -114,7 +114,13 @@ env_ok=0
 echo
 echo "Test suite:"
 tests_ok=0
-if PYTHONPATH="${REPO_DIR}" python3 -c "import pytest" 2>/dev/null; then
+if [ -n "${VERICODING_INSTALL_SELFTEST:-}" ]; then
+    # tests/test_install.py runs this script in a sandbox HOME. Without this
+    # guard that is unbounded recursion -- install.sh runs pytest, pytest runs
+    # test_install.py, test_install.py runs install.sh -- which is exactly how
+    # it was discovered.
+    echo "  skipped (already running inside the test suite)"
+elif PYTHONPATH="${REPO_DIR}" python3 -c "import pytest" 2>/dev/null; then
     PYTHONPATH="${REPO_DIR}" python3 -m pytest "${REPO_DIR}/tests" -q || tests_ok=$?
 else
     echo "  pytest not installed; skipping (it is a development dependency)"

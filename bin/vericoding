@@ -120,7 +120,7 @@ DEFAULT_MIN_SCORE = 60
 
 def cmd_pipeline(args):
     print(">>> Starting Vericoding End-to-End Pipeline <<<\n")
-    print("[1/4] Running SMT Spec Scoring & Gap Analysis...")
+    print("[1/5] Running SMT Spec Scoring & Gap Analysis...")
     import spec_scorer
     scorer = spec_scorer.SpecScorer(args.file)
     res = scorer.analyze()
@@ -176,9 +176,39 @@ def cmd_pipeline(args):
         "blockers": blockers,
         "passed": not blockers,
         "overridden": bool(blockers and args.force),
+        # An attestation, not a verification: the tool cannot know whether
+        # anyone read anything. Recording it is still worth more than not,
+        # because a receipt that omits it reads identically whether a human
+        # looked at the spec or nobody did.
+        "human_review_attested": bool(args.reviewed),
     }
 
-    print("\n[2/4] Running DafnyPro Formal Verification...")
+    # Stage 4 of the documented methodology: a human reads the specification
+    # before anything is proved about it. The README advertised this and the
+    # pipeline had no such step -- it ran score, verify, compile, receipt
+    # straight through.
+    #
+    # That omission is not cosmetic. Every automated check in this repo
+    # answers "does the implementation satisfy the spec". None of them can
+    # answer "is this the right spec", and no solver ever will: a clause that
+    # says the wrong thing verifies exactly as cleanly as one that says the
+    # right thing. The human gate is the only place that question gets asked.
+    #
+    # It is an attestation, not a verification. The tool cannot know whether
+    # anyone read anything; it can record that someone said so, and refuse to
+    # continue until they do.
+    print("\n[2/5] Human Review of the Specification...")
+    if not args.reviewed:
+        print("  Stopping for review. The checks below this point all ask whether")
+        print("  the implementation satisfies the spec. None of them can tell you")
+        print("  the spec says the right thing.")
+        print("\n  Read:  templates/review_checklist.md")
+        print(f"  And:   vericoding score {args.file}")
+        print("\n  Then re-run with --reviewed to record that you did and continue.")
+        sys.exit(3)
+    print("  ✓ Review attested by the caller (--reviewed)")
+
+    print("\n[3/5] Running DafnyPro Formal Verification...")
     import verify_loop
     verifier = verify_loop.DafnyVerifier()
     v_res = verifier.verify(args.file)
@@ -188,7 +218,7 @@ def cmd_pipeline(args):
         sys.exit(1)
     print("  ✓ Formal verification succeeded!")
 
-    print(f"\n[3/4] Compiling to Target Language: {args.target}...")
+    print(f"\n[4/5] Compiling to Target Language: {args.target}...")
     import compiler
     c = compiler.DafnyCompiler()
     c_res = c.compile(args.file, target=args.target, output_dir=args.out)
@@ -197,7 +227,7 @@ def cmd_pipeline(args):
         sys.exit(1)
     print(f"  ✓ Target compiled into: {c_res['output_dir']}")
 
-    print("\n[4/4] Archiving Proof Receipt & Cryptographic Seal...")
+    print("\n[5/5] Archiving Proof Receipt & Cryptographic Seal...")
     import receipt_generator
     rg = receipt_generator.ReceiptGenerator()
     r_res = rg.generate(args.file, nl_intent=args.intent, spec_gate=spec_gate)
@@ -266,6 +296,11 @@ def main():
         "--min-score", type=int, default=DEFAULT_MIN_SCORE,
         help="refuse to proceed below this spec confidence (default: %(default)s, "
              "the bottom of the scorer's MODERATE band)",
+    )
+    p_pipeline.add_argument(
+        "--reviewed", action="store_true",
+        help="attest that a human has read the specification (methodology "
+             "stage 4); the pipeline stops before verification without it",
     )
     p_pipeline.add_argument(
         "--force", action="store_true",

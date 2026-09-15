@@ -70,7 +70,7 @@ def test_vacuity_blocks_regardless_of_threshold(tmp_path):
 def test_force_records_the_override_in_the_receipt(tmp_path, toolchain):
     spec = tmp_path / "vacuous.dfy"
     spec.write_text(VACUOUS)
-    proc = _run(["pipeline", str(spec), "--force", "--out", str(tmp_path / "out")])
+    proc = _run(["pipeline", str(spec), "--force", "--reviewed", "--out", str(tmp_path / "out")])
     assert proc.returncode == 0, proc.stdout
 
     receipt = json.loads((tmp_path / "vacuous.receipt.json").read_text())
@@ -84,10 +84,45 @@ def test_force_records_the_override_in_the_receipt(tmp_path, toolchain):
 
 
 def test_a_sound_spec_passes_the_gate(tmp_path, toolchain):
-    proc = _run(["pipeline", "examples/bank_account/bank.dfy", "--out", str(tmp_path / "out")])
+    proc = _run(["pipeline", "examples/bank_account/bank.dfy", "--reviewed", "--out", str(tmp_path / "out")])
     assert proc.returncode == 0, proc.stdout
     assert "Completed Successfully" in proc.stdout
 
     receipt = json.loads((REPO / "examples/bank_account/bank.receipt.json").read_text())
     assert receipt["spec_gate"]["passed"] is True
     assert receipt["spec_gate"]["overridden"] is False
+
+
+def test_pipeline_stops_for_human_review(tmp_path):
+    """Methodology stage 4, which the README advertised and the code skipped.
+
+    The pipeline ran score -> verify -> compile -> receipt straight through.
+    Every check in that chain answers "does the implementation satisfy the
+    spec"; none can answer "is this the right spec", and no solver ever will.
+    A clause that says the wrong thing verifies exactly as cleanly as one that
+    says the right thing.
+
+    No toolchain needed: the stop happens before verification.
+    """
+    proc = _run(["pipeline", "examples/bank_account/bank.dfy", "--out", str(tmp_path / "out")])
+    assert proc.returncode == 3, proc.stdout
+    assert "Stopping for review" in proc.stdout
+    assert "review_checklist.md" in proc.stdout
+    assert "Completed Successfully" not in proc.stdout
+
+
+def test_reviewed_flag_continues_and_is_recorded(tmp_path, toolchain):
+    """The attestation is recorded, not verified -- the tool cannot know
+    whether anyone read anything. Recording it still beats not, because a
+    receipt that omits it reads the same either way."""
+    import json as _json
+
+    proc = _run([
+        "pipeline", "examples/bank_account/bank.dfy",
+        "--reviewed", "--out", str(tmp_path / "out"),
+    ])
+    assert proc.returncode == 0, proc.stdout
+    assert "Review attested by the caller" in proc.stdout
+
+    receipt = _json.loads((REPO / "examples/bank_account/bank.receipt.json").read_text())
+    assert receipt["spec_gate"]["human_review_attested"] is True
