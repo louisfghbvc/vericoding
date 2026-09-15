@@ -201,3 +201,74 @@ def test_env_cli_exits_non_zero_when_verification_is_impossible(monkeypatch, cap
     code = _run_main(env_mod, ["check_env.py", "--no-targets"], monkeypatch)
     assert code == 1
     assert "NOT POSSIBLE" in capsys.readouterr().out
+
+
+# --- the analyser without a solver --------------------------------------
+
+def _analyse_without_z3(tmp_path, source, monkeypatch):
+    monkeypatch.setattr(scorer_mod, "z3", None)
+    path = tmp_path / "s.dfy"
+    path.write_text(source)
+    return scorer_mod.SpecScorer(str(path)).analyze()
+
+
+VACUOUS_BY_READING = """
+method Withdraw(amt: int) returns (res: bool)
+  requires amt > 0
+  requires amt <= 1000
+  ensures res ==> true
+  ensures !res ==> true
+{ res := true; }
+"""
+
+
+def test_blatant_shape_b_is_caught_without_a_solver(tmp_path, monkeypatch):
+    """`X ==> true` is vacuous by reading, not by proving.
+
+    `requires false` has always been caught ahead of the solver for exactly
+    this reason. Leaving the mirror shapes behind the z3 guard made the
+    verdict depend on whether a package happened to be installed: on a host
+    without z3 the textbook Shape-B spec came back "not checked" instead of
+    "vacuous" -- honest, but weaker than the available evidence.
+    """
+    res = _analyse_without_z3(tmp_path, VACUOUS_BY_READING, monkeypatch)
+    assert res["methods"][0]["vacuous_clauses"] == ["res ==> true", "!res ==> true"]
+
+
+def test_the_solverless_verdict_matches_the_solver_one_here(tmp_path, monkeypatch):
+    """Same spec, same answer, with and without z3. Where the evidence does
+    not depend on the solver, neither should the report."""
+    with_z3 = scorer_mod.SpecScorer  # module-level z3 still present
+    path = tmp_path / "w.dfy"
+    path.write_text(VACUOUS_BY_READING)
+    scored = with_z3(str(path)).analyze()["overall_score"]
+    without = _analyse_without_z3(tmp_path, VACUOUS_BY_READING, monkeypatch)["overall_score"]
+    assert scored == without
+
+
+def test_a_clause_needing_the_solver_is_still_unanalysed_without_one(tmp_path, monkeypatch):
+    """The relaxation must not leak. An unsatisfiable antecedent is not
+    decidable by reading, so with no solver it stays unanalysed -- never
+    counted as live, which would credit a clause nobody checked."""
+    res = _analyse_without_z3(tmp_path, """
+    method Check(n: int) returns (ok: bool)
+      requires n >= 0
+      ensures n < 0 ==> !ok
+    { ok := true; }
+    """, monkeypatch)
+    method = res["methods"][0]
+    assert method["unanalysed_clauses"], "the clause was silently resolved without a solver"
+    assert method["live_ensures"] == [], "an unchecked clause was credited as live"
+
+
+def test_a_plain_postcondition_needs_no_solver_to_be_live(tmp_path, monkeypatch):
+    """A non-implication has no antecedent to be vacuous, so withholding the
+    solver must not demote it -- otherwise every spec on a z3-less host reads
+    as unverifiable."""
+    res = _analyse_without_z3(tmp_path, """
+    method M(x: int) returns (y: int)
+      requires x > 0
+      ensures y == x
+    { y := x; }
+    """, monkeypatch)
+    assert res["methods"][0]["live_ensures"] == ["y == x"]

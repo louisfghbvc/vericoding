@@ -599,13 +599,18 @@ class SpecScorer:
     def _check_ensures_vacuity(self, method: Dict[str, Any]) -> Dict[str, Any]:
         """Shape B: can each postcondition's antecedent ever hold?"""
         result = {"vacuous": [], "unanalysed": [], "live": []}
-        if not z3:
-            result["unanalysed"] = list(method["ensures"])
-            return result
 
         for ens in method["ensures"]:
             body = ens.strip()
 
+            # The two blatant forms need no solver: `ensures true` and
+            # `ensures X ==> true` are vacuous by reading, not by proving.
+            # _check_smt_vacuity already catches `requires false` ahead of the
+            # solver for exactly this reason, and leaving the mirror shapes
+            # behind the z3 guard made the report's verdict depend on whether
+            # a package happened to be installed -- on a host without z3 the
+            # textbook Shape-B spec came back "not checked" rather than
+            # "vacuous", which is honest but weaker than the evidence allowed.
             if body.lower() in self.TRIVIALLY_TRUE:
                 result["vacuous"].append({
                     "clause": ens,
@@ -614,20 +619,29 @@ class SpecScorer:
                 continue
 
             implies = self.RE_IMPLIES.match(body)
-            if not implies:
-                # Not an implication, so there is no antecedent to be vacuous.
-                result["live"].append(ens)
-                continue
-
-            antecedent, consequent = implies.group(1).strip(), implies.group(2).strip()
-
-            if consequent.lower() in self.TRIVIALLY_TRUE:
+            if implies and implies.group(2).strip().lower() in self.TRIVIALLY_TRUE:
                 result["vacuous"].append({
                     "clause": ens,
                     "why": "the consequent is literally `true`, so the implication "
                            "holds for every input regardless of the antecedent",
                 })
                 continue
+
+            if not implies:
+                # Not an implication, so there is no antecedent to be vacuous.
+                # Also decidable by reading.
+                result["live"].append(ens)
+                continue
+
+            if not z3:
+                # Only the remaining question -- can this antecedent ever hold
+                # under the preconditions? -- needs a solver. Unanalysed, not
+                # live: a clause nobody checked must not be counted as one
+                # that can fire.
+                result["unanalysed"].append(ens)
+                continue
+
+            antecedent, consequent = implies.group(1).strip(), implies.group(2).strip()
 
             try:
                 var_map: Dict[str, Any] = {}
