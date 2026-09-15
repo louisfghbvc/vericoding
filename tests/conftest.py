@@ -67,3 +67,36 @@ def toolchain():
     if reason:
         pytest.skip(reason)
     return True
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _examples_are_read_only():
+    """Restore examples/ after the session, whatever the tests did to it.
+
+    Defence in depth behind "tests should use copies". A suite that mutates
+    committed fixtures is one interrupted run away from a false failure: an
+    aborted run left bank.receipt.json inconsistent with the bank.smt2 beside
+    it, and the next run reported four failures that were not defects. It
+    also makes `git status` permanently dirty, so a real change hides in the
+    churn.
+
+    Snapshot-and-restore rather than chmod, so a test that legitimately needs
+    to write still can -- it just cannot leave the tree changed.
+    """
+    import pathlib
+    import shutil
+    import tempfile
+
+    examples = pathlib.Path(__file__).resolve().parent.parent / "examples"
+    if not examples.is_dir():
+        yield
+        return
+
+    backup = tempfile.mkdtemp(prefix="vericoding-examples-")
+    shutil.copytree(examples, pathlib.Path(backup) / "examples")
+    try:
+        yield
+    finally:
+        shutil.rmtree(examples, ignore_errors=True)
+        shutil.copytree(pathlib.Path(backup) / "examples", examples)
+        shutil.rmtree(backup, ignore_errors=True)
