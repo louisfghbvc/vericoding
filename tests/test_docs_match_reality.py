@@ -128,3 +128,68 @@ def test_docs_do_not_claim_an_automated_repair_loop():
         text = (REPO / doc).read_text(encoding="utf-8")
         assert "Max 5x" not in text
         assert "up to 5 times" not in text
+
+
+def test_every_expression_documented_as_readable_actually_parses(tmp_path):
+    """SKILL.md's fragment table, executed.
+
+    A documented capability nobody runs is a claim, and this repo's whole
+    subject is claims that outrun their evidence. If the table drifts from
+    the parser, a reader concludes their spec is unusual when it is simply
+    unsupported -- or the reverse.
+
+    The examples are read out of the document rather than restated here, so
+    editing the table without editing the parser fails.
+    """
+    import pathlib
+    import re
+
+    from scripts.spec_scorer import SpecScorer
+
+    skill = pathlib.Path(__file__).resolve().parent.parent / "SKILL.md"
+    body = skill.read_text(encoding="utf-8")
+    section = body.split("### What the analyser can read", 1)
+    assert len(section) == 2, "the fragment section is gone from SKILL.md"
+    table = section[1].split("Everything else", 1)[0]
+
+    examples = []
+    for row in table.splitlines():
+        if not row.startswith("|") or ":---" in row or "example" in row:
+            continue
+        # Split on unescaped pipes only: a cell may contain `\|` (Dafny's `||`
+        # has to be escaped inside a markdown table), and splitting there
+        # truncates the expression into something that cannot parse -- making
+        # the test fail on its own parsing rather than on the tool's.
+        cells = [c.strip() for c in re.split(r'(?<!\\)\|', row.strip("|"))]
+        if len(cells) < 2:
+            continue
+        examples += [e.strip(" `").replace("\\|", "|")
+                     for e in cells[1].split("`, `") if e.strip(" `")]
+
+    assert len(examples) >= 8, "parsed too few examples from the table: %r" % examples
+
+    unreadable = []
+    for expression in examples:
+        if "==>" in expression:
+            spec = ("method M(x: int, y: int) returns (ok: bool)\n"
+                    "  requires x > 0\n  ensures %s\n{ ok := true; }\n" % expression)
+            method = SpecScorer(_write(tmp_path, spec)).analyze()["methods"][0]
+            if method["unanalysed_clauses"]:
+                unreadable.append(expression)
+            continue
+        spec = ("method M(x: int, y: int, ok: bool) returns (r: int)\n"
+                "  requires %s\n  ensures r == x\n{ r := x; }\n" % expression)
+        gaps = SpecScorer(_write(tmp_path, spec)).analyze()["methods"][0]["gaps"]
+        if any(g["status"] == "NOT ANALYSED" for g in gaps):
+            unreadable.append(expression)
+
+    assert not unreadable, (
+        "SKILL.md lists these as readable but the analyser reports them "
+        "unanalysed: %r" % unreadable)
+
+
+def _write(tmp_path, spec):
+    import hashlib
+    path = tmp_path / ("doc_%s.dfy" % hashlib.sha256(spec.encode()).hexdigest()[:8])
+    path.write_text(spec)
+    return str(path)
