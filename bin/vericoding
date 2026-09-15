@@ -105,6 +105,11 @@ def cmd_audit(args):
     sys.exit(0 if ok else 1)
 
 
+# Below this the specification is, by the scorer's own label, LOW confidence.
+# Chosen to match the band the tool already reports rather than invented here.
+DEFAULT_MIN_SCORE = 60
+
+
 def cmd_pipeline(args):
     print(">>> Starting Vericoding End-to-End Pipeline <<<\n")
     print("[1/4] Running SMT Spec Scoring & Gap Analysis...")
@@ -112,6 +117,58 @@ def cmd_pipeline(args):
     scorer = spec_scorer.SpecScorer(args.file)
     res = scorer.analyze()
     print(f"  Spec Confidence: {res['overall_score']}% [{res['confidence_level']}]")
+
+    # The score used to be printed here and never read again. That made the
+    # scorer decorative in the one command where it matters most: a
+    # specification whose only postcondition can never fire verifies cleanly,
+    # compiles, and collects a cryptographic receipt, because no verifier can
+    # see that shape. Measured before this gate, end to end, exit 0:
+    #
+    #   Spec Confidence: 15.0% [LOW]
+    #   ✓ Formal verification succeeded!
+    #   ✓ Cryptographic Receipt Seal: 9219c342...
+    #   >>> Vericoding Pipeline Completed Successfully! Math, Not Vibes. <<<
+    #
+    # The scorer is the only thing standing between a vacuous spec and a
+    # signed receipt. Discarding its verdict removed the guard entirely.
+    vacuous = [c for m in res["methods"] for c in m.get("vacuous_clauses", [])]
+    blockers = []
+    if vacuous:
+        # Categorical, not a matter of degree: a clause that cannot fire
+        # protects nothing no matter what the rest of the spec scores.
+        blockers.append(
+            "{} vacuous clause(s) found: {}".format(
+                len(vacuous), "; ".join(vacuous[:3]) + ("; ..." if len(vacuous) > 3 else "")
+            )
+        )
+    if res["overall_score"] < args.min_score:
+        blockers.append(
+            "score {}% is below the --min-score threshold of {}%".format(
+                res["overall_score"], args.min_score
+            )
+        )
+
+    if blockers:
+        for blocker in blockers:
+            print(f"  ✗ {blocker}")
+        if not args.force:
+            print("\n  Stopping. A proof about this specification would be a proof")
+            print("  about the wrong thing. Run `vericoding score <file>` for the")
+            print("  gap report, or pass --force to continue anyway.")
+            sys.exit(1)
+        print("\n  --force given: continuing despite the above.")
+        print("  The receipt will record that this gate was overridden.")
+
+    spec_gate = {
+        "evaluated": True,
+        "score": res["overall_score"],
+        "confidence": res["confidence_level"],
+        "min_score": args.min_score,
+        "vacuous_clauses": vacuous,
+        "blockers": blockers,
+        "passed": not blockers,
+        "overridden": bool(blockers and args.force),
+    }
 
     print("\n[2/4] Running DafnyPro Formal Verification...")
     import verify_loop
@@ -135,7 +192,7 @@ def cmd_pipeline(args):
     print("\n[4/4] Archiving Proof Receipt & Cryptographic Seal...")
     import receipt_generator
     rg = receipt_generator.ReceiptGenerator()
-    r_res = rg.generate(args.file, nl_intent=args.intent)
+    r_res = rg.generate(args.file, nl_intent=args.intent, spec_gate=spec_gate)
     print(f"  ✓ Cryptographic Receipt Seal: {r_res['receipt_seal_sha256']}")
     print("\n>>> Vericoding Pipeline Completed Successfully! Math, Not Vibes. <<<")
 
@@ -192,6 +249,15 @@ def main():
     p_pipeline.add_argument("--target", default="py", help="Target language (py, go, js, cs)")
     p_pipeline.add_argument("--intent", default=None, help="Natural language intent description")
     p_pipeline.add_argument("--out", default=None, help="Output directory for compilation")
+    p_pipeline.add_argument(
+        "--min-score", type=int, default=DEFAULT_MIN_SCORE,
+        help="refuse to proceed below this spec confidence (default: %(default)s, "
+             "the bottom of the scorer's MODERATE band)",
+    )
+    p_pipeline.add_argument(
+        "--force", action="store_true",
+        help="proceed even when the spec gate fails; the override is recorded",
+    )
     p_pipeline.set_defaults(func=cmd_pipeline)
 
     args = parser.parse_args()

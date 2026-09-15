@@ -46,7 +46,8 @@ class ReceiptGenerator:
         file_path: str,
         nl_intent: Optional[str] = None,
         output_receipt_path: Optional[str] = None,
-        dump_smt: bool = True
+        dump_smt: bool = True,
+        spec_gate: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -94,6 +95,12 @@ class ReceiptGenerator:
                 "z3_version": env_diag["z3_python"]["version"] or env_diag["z3_cli"]["version"],
                 "platform": sys.platform,
             },
+            # What the specification gate said, and whether someone went past
+            # it. A receipt that omits this reads identically whether the spec
+            # passed on its merits or was forced through at 15% with a vacuous
+            # clause -- and the second case is exactly the one a reader needs
+            # to know about. Sealed with the rest, so it cannot be edited out.
+            "spec_gate": spec_gate or {"evaluated": False},
             "proof_artifact": {
                 "smt2_file": smt_artifact_path,
                 # Never assert replayability we have not demonstrated. An
