@@ -114,6 +114,14 @@ def _wraps_whole(text: str) -> bool:
     return False
 
 
+# Band boundaries for the reported confidence level. Named because the
+# scoring refers to them: a method with a clause the analyser could not read
+# is capped just below HIGH, since "high confidence" is precisely the claim
+# an unread clause does not support.
+HIGH_CONFIDENCE_MIN = 85
+MODERATE_CONFIDENCE_MIN = 60
+
+
 def _split_top_level(text: str, separator: str):
     """Split on `separator`, ignoring occurrences inside parentheses.
 
@@ -258,9 +266,9 @@ class SpecScorer:
         avg_score = round(total_score / len(self.parser.methods), 1)
         results["overall_score"] = avg_score
 
-        if avg_score >= 85:
+        if avg_score >= HIGH_CONFIDENCE_MIN:
             results["confidence_level"] = "HIGH"
-        elif avg_score >= 60:
+        elif avg_score >= MODERATE_CONFIDENCE_MIN:
             results["confidence_level"] = "MODERATE"
         else:
             results["confidence_level"] = "LOW"
@@ -475,6 +483,26 @@ class SpecScorer:
             })
 
         final_score = max(0, min(100, score))
+
+        # A spec with an unread clause cannot reach the band that means
+        # "fully established".
+        #
+        # Without this the bundled example printed
+        #
+        #     Spec Confidence  : 100.0% [HIGH]
+        #     ? [NOT ANALYSED] precondition `Valid()` was not expressible ...
+        #
+        # -- a headline of complete confidence directly above the note saying
+        # part of the spec was never checked. The per-clause penalties were
+        # there and correct; the clamp at 100 swallowed them, because these
+        # methods scored well past the ceiling on their other merits. A cap is
+        # the only thing that survives the clamp.
+        #
+        # The number is the band boundary rather than a tuned constant: the
+        # claim being withheld is specifically "HIGH", and the gap list still
+        # says exactly which clause went unread.
+        if any(g["status"] == "NOT ANALYSED" for g in gaps):
+            final_score = min(final_score, HIGH_CONFIDENCE_MIN - 1)
 
         return {
             "method_name": method["name"],

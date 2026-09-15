@@ -12,7 +12,8 @@ biconditional, and anything with a `&&` inside parentheses.
 
 import pytest
 
-from scripts.spec_scorer import SpecScorer, _split_top_level
+from scripts.spec_scorer import (HIGH_CONFIDENCE_MIN, SpecScorer,
+                                 _split_top_level)
 
 
 def _analyse(tmp_path, spec):
@@ -139,3 +140,65 @@ def test_an_operator_inside_a_call_does_not_split_the_clause(tmp_path):
     statuses = _statuses(tmp_path, PRE % "f(x && y) > 0")
     assert "NOT ANALYSED" in statuses
     assert "CONTRADICTION" not in statuses
+
+
+# --- the headline must agree with the notes ------------------------------
+
+def test_an_unread_clause_forbids_a_high_confidence_verdict(tmp_path):
+    """The report cannot lead with complete confidence and then admit it did
+    not read part of the spec.
+
+    The bundled example printed exactly that:
+
+        Spec Confidence  : 100.0% [HIGH]
+        ? [NOT ANALYSED] precondition `Valid()` was not expressible ...
+
+    The per-clause penalties existed and were correct; the clamp at 100
+    swallowed them, because the method scored well past the ceiling on its
+    other merits. A reader who trusts the headline never reaches the note.
+
+    This fixture is deliberately one that scores 100 with the cap removed --
+    an earlier version of this test used a spec that landed at 82 either way,
+    so it asserted a true thing without pinning the behaviour, and deleting
+    the cap left it green.
+    """
+    res, _ = _analyse(tmp_path, """
+    method Withdraw(amount: int) returns (ok: bool)
+      requires Valid()
+      requires amount > 0
+      modifies this
+      ensures Valid()
+      ensures ok ==> balance == old(balance) - amount
+      ensures !ok ==> balance == old(balance)
+      ensures balance >= 0
+    { ok := false; }
+    """)
+    assert any(g["status"] == "NOT ANALYSED" for g in res["methods"][0]["gaps"])
+    assert res["confidence_level"] != "HIGH"
+    assert res["overall_score"] < HIGH_CONFIDENCE_MIN
+
+
+def test_a_fully_readable_spec_can_still_reach_high(tmp_path):
+    """The cap must not become a ceiling on everything -- otherwise HIGH is
+    unreachable and the band carries no information."""
+    res, method = _analyse(tmp_path, """
+    method Withdraw(amount: int, balance: int) returns (ok: bool, newBalance: int)
+      requires amount > 0
+      requires balance >= 0
+      ensures ok ==> newBalance == balance - amount
+      ensures !ok ==> newBalance == balance
+      ensures newBalance >= 0
+    { ok := false; newBalance := balance; }
+    """)
+    assert not any(g["status"] == "NOT ANALYSED" for g in method["gaps"])
+    assert res["confidence_level"] == "HIGH"
+
+
+def test_the_bundled_example_reports_what_it_actually_established():
+    """End to end on a file that ships with the tool, so the number a new
+    reader sees first is one the tool can defend."""
+    res = SpecScorer("examples/bank_account/bank.dfy").analyze()
+    unread = [g for m in res["methods"] for g in m["gaps"]
+              if g["status"] == "NOT ANALYSED"]
+    assert unread, "fixture drifted: this example is meant to have an unread clause"
+    assert res["confidence_level"] != "HIGH"
