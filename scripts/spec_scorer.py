@@ -114,6 +114,32 @@ def _wraps_whole(text: str) -> bool:
     return False
 
 
+def _split_top_level(text: str, separator: str):
+    """Split on `separator`, ignoring occurrences inside parentheses.
+
+    `re.split` cannot do this: it breaks `(a || b) && c` at the `&&` correctly
+    but breaks `f(a && b) > 0` in the middle of an argument list. Depth is the
+    only thing that distinguishes them.
+    """
+    parts, depth, current = [], 0, []
+    index, width, length = 0, len(separator), len(text)
+    while index < length:
+        ch = text[index]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if depth == 0 and text.startswith(separator, index):
+            parts.append("".join(current))
+            current = []
+            index += width
+            continue
+        current.append(ch)
+        index += 1
+    parts.append("".join(current))
+    return [p for p in (part.strip() for part in parts) if p]
+
+
 def _unwrap_parens(text: str) -> str:
     """Remove parentheses that wrap the whole expression, however many."""
     text = text.strip()
@@ -505,7 +531,14 @@ class SpecScorer:
     RE_ATOM = re.compile(
         r'^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(>=|<=|==|!=|>|<)\s*(-?\d+|[a-zA-Z_][a-zA-Z0-9_]*)\s*$'
     )
-    RE_IMPLIES = re.compile(r'^(.*?)==>(.*)$')
+    # `<==>` contains `==>`. Without the lookbehind, `ensures ok <==> x > 10`
+    # matched as an implication with the antecedent `ok <`, which parses as
+    # nothing -- so a correct, constraining biconditional was reported as
+    # unanalysed, counted as zero live postconditions, and told "no
+    # postcondition that can ever fire". It scored 15. A biconditional has no
+    # antecedent to be vacuous, so declining to match it here is also the
+    # right answer, not just a narrower one.
+    RE_IMPLIES = re.compile(r'^(.*?)(?<!<)==>(.*)$')
     TRIVIALLY_TRUE = {"true"}
     TRIVIALLY_FALSE = {"false"}
 
@@ -569,9 +602,20 @@ class SpecScorer:
         # correct, but it leaves each conjunct wearing its own parens, which
         # `_atom` cannot read either. Unwrapping only the outside fixed the
         # mangling and left the clause just as unanalysed.
-        parts = [_unwrap_parens(p) for p in re.split(r'&&', text) if p.strip()]
+        parts = [_unwrap_parens(p) for p in _split_top_level(text, "&&")]
         terms, unparsed = [], []
         for part in parts:
+            # A disjunct is not an atom. Handing `a || b` straight to `_atom`
+            # makes it unparsed, which now costs a clause 20 points -- so an
+            # ordinary `requires x > 0 || y > 0` was penalised for being
+            # ordinary.
+            if len(_split_top_level(part, "||")) > 1:
+                or_terms, or_unparsed = self._disjunction(part, var_map, bool_map)
+                if or_unparsed:
+                    unparsed.extend(or_unparsed)
+                else:
+                    terms.append(or_terms)
+                continue
             # Literals are `_atom`'s job now. Keeping a second copy of the
             # rule here is what let `!true` slip between them: this loop
             # matched only the bare spellings and `_atom` deferred to this
@@ -583,6 +627,32 @@ class SpecScorer:
             else:
                 terms.append(atom)
         return terms, unparsed
+
+    def _disjunction(self, text: str, var_map: Dict[str, Any],
+                     bool_map: Dict[str, Any]):
+        """Translate `a || b || c` into one Or term, or report it unparsed.
+
+        All or nothing, and the asymmetry with `_conjunction` is deliberate.
+        Dropping a conjunct the fragment cannot read makes the constraint
+        WEAKER: the solver may then find a model that the real precondition
+        forbids, so a genuine contradiction goes unnoticed. That is a missed
+        finding, and it is already reported as NOT ANALYSED.
+
+        Dropping a disjunct makes the constraint STRONGER. `x > 0 || f(y)`
+        reduced to `x > 0` rules out states the spec allows, and if the
+        remaining terms happen to be unsatisfiable the check reports
+        CONTRADICTION -- a vacuity finding against a specification that has
+        none. A false accusation is worse than a missed one here: it is the
+        one output a reader cannot audit without redoing the work by hand.
+        """
+        disjuncts = [_unwrap_parens(p) for p in _split_top_level(text, "||")]
+        terms = []
+        for disjunct in disjuncts:
+            sub_terms, sub_unparsed = self._conjunction(disjunct, var_map, bool_map)
+            if sub_unparsed or not sub_terms:
+                return None, [text]
+            terms.append(sub_terms[0] if len(sub_terms) == 1 else z3.And(*sub_terms))
+        return z3.Or(*terms), []
 
     # `assume false` is the body-level equivalent of `requires false`: it makes
     # everything after it unreachable, so every postcondition holds for any
