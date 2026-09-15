@@ -372,9 +372,28 @@ class SpecScorer:
         # awarded the same credit for "no contradiction found" as for "checked
         # and sound", which let an unparsed spec collect points for silence.
         if smt_check.get("analysed"):
-            strengths.append("Preconditions are jointly satisfiable (no Shape-A vacuity).")
-            score += 5
-            for expr in smt_check.get("unparsed", []):
+            # The claim has to be no stronger than the check. When a clause was
+            # outside the fragment the solver never saw it, so "the
+            # preconditions are jointly satisfiable" is not what was
+            # established -- only that the readable SUBSET is. If the excluded
+            # clause is itself unsatisfiable (`requires Valid(s)` where Valid
+            # is false everywhere) the unqualified claim is simply wrong, and
+            # it is wrong in the flattering direction. The gap list said
+            # NOT ANALYSED all along; the strengths line contradicted it in
+            # the one place a reader skims.
+            unparsed = smt_check.get("unparsed", [])
+            if unparsed:
+                checked = smt_check.get("parsed_count", 0)
+                strengths.append(
+                    "The {} expressible precondition(s) are jointly satisfiable; "
+                    "{} not analysed, so Shape-A vacuity is not ruled out.".format(
+                        checked, len(unparsed))
+                )
+                score += 2   # a partial check is worth less than a whole one
+            else:
+                strengths.append("Preconditions are jointly satisfiable (no Shape-A vacuity).")
+                score += 5
+            for expr in unparsed:
                 gaps.append({
                     "category": "Coverage",
                     "status": "NOT ANALYSED",
@@ -567,8 +586,13 @@ class SpecScorer:
                     "detail": "the requires clauses have no common solution (unsat), "
                               "so the method is unreachable and any body verifies",
                 }
+            # parsed_count is how many assertions the solver actually reasoned
+            # over. The caller needs it to state the sat result at the strength
+            # the check earned, rather than generalising it to clauses the
+            # solver never saw.
             return {"analysed": True, "has_contradiction": False,
-                    "unparsed": unparsed_total}
+                    "unparsed": unparsed_total,
+                    "parsed_count": len(solver.assertions())}
         except Exception as ex:
             return {"analysed": False, "note": str(ex)}
 
