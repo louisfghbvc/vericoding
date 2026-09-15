@@ -172,3 +172,63 @@ def test_a_method_with_no_body_is_still_parsed(tmp_path):
       ensures y == x
     """).methods
     assert len(methods) == 1 and methods[0]["name"] == "Stub"
+
+
+def test_receipt_create_prints_how_to_replay_the_proof(tmp_path, monkeypatch, capsys):
+    """The line that makes a receipt worth more than an assertion.
+
+    The whole claim of a proof artifact is that a third party can re-check it
+    without trusting this pipeline, this machine, or the model that wrote the
+    code. That is only true if the receipt tells them how. Printing the
+    artifact path and assertion count without the replay command leaves the
+    reader with a file and no verb.
+    """
+    source = tmp_path / "unit.dfy"
+    source.write_text("method M() {}\n")
+    artifact = tmp_path / "unit.smt2"
+    artifact.write_text("(assert (and (> 1 0) (< 1 0)))\n(check-sat)\n")
+
+    monkeypatch.setattr(receipt_mod.ReceiptGenerator, "_emit_proof_artifact",
+                        lambda self, p: {"path": str(artifact),
+                                         "sha256": receipt_mod.compute_file_sha256(str(artifact)),
+                                         "replayable": True, "assertion_count": 7})
+    monkeypatch.setattr(receipt_mod.DafnyVerifier, "verify",
+                        lambda self, p, **kw: {"verified": True, "status": "PROVED",
+                                               "raw_output": "", "errors": []})
+
+    _run(receipt_mod, ["receipt_generator.py", "create", str(source)], monkeypatch)
+    out = capsys.readouterr().out
+    assert str(artifact) in out
+    assert "7 assertions" in out
+    assert "Replay with" in out, "a proof was announced with no way to check it"
+
+
+def test_env_probe_verifies_rather_than_asking_for_a_version(monkeypatch):
+    """`--version` answers a question nobody asked. Whether Dafny can complete
+    a verification on this host is the thing that decides if a proof means
+    anything, and only running one answers it.
+    """
+    seen = {}
+
+    def record(args, timeout):
+        seen["args"] = args
+        return {"ok": True}
+
+    monkeypatch.setattr(env_mod, "_run_probe", record)
+    assert env_mod.probe_verification()["ok"] is True
+    assert seen["args"] == ["verify"], (
+        "the probe asked something other than 'can you verify': %r" % (seen,))
+
+
+def test_an_empty_clause_body_is_skipped_not_recorded(tmp_path):
+    """`requires ;` contributes nothing. Recording it as a clause would let a
+    spec collect precondition credit for punctuation."""
+    from scripts.spec_scorer import DafnySpecParser
+    methods = DafnySpecParser("""
+    method M(x: int) returns (y: int)
+      requires ;
+      requires x > 0
+      ensures y == x
+    { y := x; }
+    """).methods
+    assert methods[0]["requires"] == ["x > 0"]
