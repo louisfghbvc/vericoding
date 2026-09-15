@@ -21,6 +21,9 @@ INSTALL = str(REPO / "install.sh")
 def _run(home, args=()):
     env = dict(os.environ)
     env["HOME"] = str(home)
+    # install.sh runs the test suite as its last step. Without this the suite
+    # would re-enter itself without bound.
+    env["VERICODING_INSTALL_SELFTEST"] = "1"
     return subprocess.run(
         ["bash", INSTALL, *args],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -90,6 +93,7 @@ def test_install_succeeds_even_when_the_host_cannot_verify(tmp_path, monkeypatch
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["PATH"] = "/usr/bin:/bin"          # no dafny
+    env["VERICODING_INSTALL_SELFTEST"] = "1"
     env.pop("VERICODING_Z3", None)
     proc = subprocess.run(
         ["bash", INSTALL], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
