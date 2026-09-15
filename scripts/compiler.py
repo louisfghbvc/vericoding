@@ -65,10 +65,16 @@ SUPPORTED_TARGETS = TARGET_ALIASES
 #
 # Naming the requirement turns a raw third-party stack trace into an
 # actionable message.
+#
+# These name what the TARGET needs, which is not the same as what is missing
+# on any given host -- on the host these were measured, Node.js was present
+# and the JavaScript build still failed, on `bignumber.js`. Reporting "needs
+# Node.js" there would have been false. The probe's own error text says what
+# actually went wrong; this says what the target requires in general.
 TARGET_REQUIREMENTS = {
     "py": None,
     "go": "a Go toolchain including `goimports` (go install golang.org/x/tools/cmd/goimports@latest)",
-    "js": "Node.js",
+    "js": "Node.js plus the `bignumber.js` package (npm install bignumber.js)",
     "cs": "the .NET SDK (`dotnet build`)",
 }
 

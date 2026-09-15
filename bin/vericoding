@@ -43,7 +43,11 @@ if SCRIPT_DIR not in sys.path:
 
 def cmd_env(args):
     import check_env
-    check_env.print_report()
+    # Exit non-zero when this host cannot verify, so CI and scripts can branch
+    # on it without parsing the report. `env` used to always exit 0, which made
+    # it useless as a gate -- the one thing a diagnostic command is for.
+    ok = check_env.print_report(probe_targets=not args.no_targets)
+    sys.exit(0 if ok else 1)
 
 
 def cmd_score(args):
@@ -145,6 +149,8 @@ def main():
 
     # env
     p_env = sub.add_parser("env", help="Check verification and compilation toolchain environment")
+    p_env.add_argument("--no-targets", action="store_true",
+                       help="skip the per-target build probes; verification is still probed")
     p_env.set_defaults(func=cmd_env)
 
     # score
