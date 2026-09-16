@@ -289,6 +289,12 @@ def replay_proof(smt2_path: str, solver_path: Optional[str] = None) -> Dict[str,
     machine, or the model that wrote the code. Until something actually runs
     it, "replayable: true" is a claim about a file nobody has opened.
 
+    Returns `checked: False` and a reason when nothing ran, and deliberately
+    carries NO `ok` key in that case. `ok: False` would read as "the proof
+    failed" where the truth is "nothing was checked", and the caller routes
+    those differently -- one is a failure, the other a note. Adding the key
+    for symmetry is the obvious tidy-up and would collapse the distinction.
+
     A genuine Dafny proof log asks the solver to refute the negation of each
     obligation, so every `(check-sat)` must answer `unsat`. A single `sat`
     means an obligation was satisfiable in its negated form -- the proof does

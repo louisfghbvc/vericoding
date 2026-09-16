@@ -60,20 +60,27 @@ def test_a_failing_target_reports_the_real_error_and_the_requirement(monkeypatch
     assert "Verification does not require any of these" in out
 
 
-def test_diagnostics_probe_every_documented_target():
+def test_diagnostics_probe_every_documented_target(monkeypatch):
     """A target the compiler accepts but the report never mentions is how the
-    C# target went missing from the old report entirely."""
+    C# target went missing from the old report entirely.
+
+    Uses monkeypatch rather than save/restore: the hand-rolled version patched
+    two attributes and restored one, so `probe_verification` stayed stubbed to
+    `{"ok": True}` for the remainder of the session. Every later test that
+    depended on the real probe silently got a stub that always says yes --
+    including tests whose subject is whether verification is possible here.
+    A fixture that cannot forget is the fix; remembering is the part that
+    failed.
+    """
     from scripts.compiler import TARGET_NAMES
 
     import scripts.check_env as ce
     captured = {}
 
-    original = ce.probe_target
-    try:
-        ce.probe_target = lambda t: captured.setdefault(t, {"ok": True, "reason": None})
-        ce.probe_verification = lambda: {"ok": True, "reason": None}
-        ce.run_diagnostics(probe_targets=True)
-    finally:
-        ce.probe_target = original
+    monkeypatch.setattr(
+        ce, "probe_target",
+        lambda t: captured.setdefault(t, {"ok": True, "reason": None}))
+    monkeypatch.setattr(ce, "probe_verification", lambda: {"ok": True, "reason": None})
+    ce.run_diagnostics(probe_targets=True)
 
     assert set(captured) == set(TARGET_NAMES)

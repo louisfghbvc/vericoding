@@ -100,3 +100,46 @@ def _examples_are_read_only():
         shutil.rmtree(examples, ignore_errors=True)
         shutil.copytree(pathlib.Path(backup) / "examples", examples)
         shutil.rmtree(backup, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_stubs():
+    """Fail the test that leaves a stub behind, instead of the one that trips
+    over it.
+
+    `test_diagnostics_probe_every_documented_target` used to patch two module
+    attributes by hand and restore one, so `check_env.probe_verification`
+    stayed stubbed to `{"ok": True}` for the rest of the session. Nothing went
+    red. The suite stayed green for many runs while every later test that
+    touched the real probe was quietly reading a stub that always says yes --
+    including tests whose whole subject is whether verification is possible on
+    this host.
+
+    That is the gate-vacuity pattern one level down: a check that cannot fail
+    because the thing it inspects was replaced by something that always
+    passes. It is worth a guard precisely because the symptom appears far from
+    the cause -- when it finally surfaced it looked like an order-dependent
+    bug in an unrelated new test.
+
+    A callable on a `scripts.*` module that was defined in a test module is
+    always a leak; no production code defines functions there.
+    """
+    import sys
+
+    yield
+
+    leaked = []
+    for mod_name, module in list(sys.modules.items()):
+        if not mod_name.startswith("scripts.") or module is None:
+            continue
+        for attr_name, value in list(vars(module).items()):
+            origin = getattr(value, "__module__", None)
+            if not callable(value) or not origin:
+                continue
+            if origin.startswith("test_") or origin.startswith("tests."):
+                leaked.append("{}.{} <- {}".format(mod_name, attr_name, origin))
+
+    assert not leaked, (
+        "test-double left installed after the test finished; every later test "
+        "sees it:\n  " + "\n  ".join(leaked)
+    )

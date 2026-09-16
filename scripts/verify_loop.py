@@ -132,6 +132,25 @@ class DafnyVerifier:
 
     def _classify(self, raw_out: str) -> tuple:
         """Derive the verdict from Dafny's output, never from its exit code."""
+        summaries = RE_SUMMARY.findall(raw_out)
+
+        # Measured: Dafny emits exactly one summary, even for several files in
+        # one invocation -- it aggregates. So more than one means the output is
+        # not what this function was built to read, and the honest answer is
+        # that nothing was established, not a guess at which one counts.
+        #
+        # Guessing is what the two readers of this line used to do, and they
+        # guessed differently: tools/dafny-verify.sh took the last match, this
+        # took the first. They would disagree on exactly the input where it
+        # mattered, and the reason to refuse rather than to pick a rule is that
+        # a second summary is more likely to be forged than emitted.
+        if len(summaries) > 1:
+            return STATUS_TOOLCHAIN, (
+                "Dafny's output contains {} verification summaries; exactly one "
+                "is expected. Refusing to choose between them -- an ambiguous "
+                "transcript establishes nothing.".format(len(summaries))
+            )
+
         summary = RE_SUMMARY.search(raw_out)
         if not summary:
             hint = ""

@@ -97,6 +97,38 @@ Read the gap report, not the percentage. `✓` established, `⚠` weak, `✗`
 defect, **`?` not analysed — which is not a pass.** Clauses the analyser could
 not parse were neither credited nor cleared; read those yourself.
 
+### What the analyser can read
+
+The satisfiability check runs on a deliberately small expression fragment.
+Knowing its edge tells you when a `?` means "your spec is unusual" rather
+than "your spec is wrong":
+
+| readable | example |
+| :--- | :--- |
+| integer comparison | `x > 0`, `x <= y` |
+| boolean identifier, negated or not | `ok`, `!ok` |
+| literals, negated or not | `true`, `false`, `!true` |
+| conjunction, disjunction, parentheses | `(x > 0 \|\| y > 0) && x < 5` |
+| implication | `ok ==> y == x` |
+| biconditional (treated as having no antecedent) | `ok <==> x > 10` |
+
+Everything else — quantifiers, uninterpreted predicates like `Valid()`,
+arithmetic on both sides, sequence and set operators — is reported `?` and
+**costs the clause the same as being vacuous**. That is deliberate: on the
+evidence available, a clause nobody read is indistinguishable from one that
+protects nothing, and scoring it as the better of the two is a claim the
+check did not earn.
+
+For the same reason a spec with any `?` is capped just below `HIGH`. If the
+tool could not read all of it, "high confidence" is not available — however
+good the rest looks.
+
+One asymmetry worth knowing, because it decides which way the tool errs:
+an unreadable **conjunct** is dropped (the check gets weaker, so a real
+contradiction may be missed and is reported as `?`), while an unreadable
+**disjunct** makes the whole clause `?` (dropping it would make the check
+stronger and could accuse a sound spec of vacuity).
+
 ## Stage 4 — Human review
 
 Present the gap report to the user. Ask about the domain decisions it
