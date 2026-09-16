@@ -79,10 +79,21 @@ class ReceiptGenerator:
         smt_artifact_path = artifact["path"]
         smt_hash = artifact["sha256"]
 
+        # Paths are recorded relative to the receipt itself, so a receipt and
+        # the tree it describes travel together. Recording an absolute source
+        # path made every receipt resolve on exactly one machine and one
+        # directory; anywhere else the auditor said "source file not found",
+        # which reads as tampering rather than as an unportable path. A
+        # cwd-relative path has the same defect one step removed -- it happens
+        # to work only while the auditor runs from the directory the generator
+        # ran from.
+        target_receipt_path = output_receipt_path or f"{os.path.splitext(file_path)[0]}.receipt.json"
+        receipt_dir = os.path.dirname(os.path.abspath(target_receipt_path))
+
         receipt = {
             "schema_version": "vericoding.proof.v1",
             "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source_file": os.path.abspath(file_path),
+            "source_file": os.path.relpath(os.path.abspath(file_path), receipt_dir),
             "hashes": {
                 "natural_language_intent_sha256": intent_hash,
                 "dafny_source_sha256": file_hash,
@@ -107,7 +118,10 @@ class ReceiptGenerator:
             # to know about. Sealed with the rest, so it cannot be edited out.
             "spec_gate": spec_gate or {"evaluated": False},
             "proof_artifact": {
-                "smt2_file": smt_artifact_path,
+                "smt2_file": (
+                    os.path.relpath(os.path.abspath(smt_artifact_path), receipt_dir)
+                    if smt_artifact_path else None
+                ),
                 # Never assert replayability we have not demonstrated. An
                 # artifact nobody has re-run is a claim, not a proof.
                 "replayable": artifact["replayable"],
@@ -127,7 +141,6 @@ class ReceiptGenerator:
         receipt_seal = compute_sha256(json.dumps(receipt, sort_keys=True))
         receipt["receipt_seal_sha256"] = receipt_seal
 
-        target_receipt_path = output_receipt_path or f"{os.path.splitext(file_path)[0]}.receipt.json"
         with open(target_receipt_path, "w", encoding="utf-8") as rf:
             json.dump(receipt, rf, indent=2)
 
@@ -239,6 +252,35 @@ def recompute_seal(data: Dict[str, Any]) -> str:
     return compute_sha256(json.dumps(body, sort_keys=True))
 
 
+def resolve_recorded_path(receipt_file: str, recorded: Optional[str]) -> Optional[str]:
+    """Locate a path a receipt recorded, from wherever the auditor is standing.
+
+    Receipts issued now record paths relative to the receipt itself, so the
+    receipt and the tree it describes travel together. Two older spellings are
+    still accepted, because refusing them would report an honest receipt as a
+    failed audit:
+
+      * absolute -- what `source_file` used to be, and still resolvable on the
+        host that issued it;
+      * relative to the process cwd -- what `smt2_file` used to be, which
+        worked only when the auditor ran from the generator's directory.
+
+    Returns the receipt-relative candidate when nothing exists, so the failure
+    message names the path an auditor should expect to find.
+    """
+    if not recorded:
+        return None
+    if os.path.isabs(recorded):
+        return recorded
+
+    beside_receipt = os.path.join(
+        os.path.dirname(os.path.abspath(receipt_file)), recorded)
+    for candidate in (beside_receipt, recorded):
+        if os.path.exists(candidate):
+            return candidate
+    return beside_receipt
+
+
 def replay_proof(smt2_path: str, solver_path: Optional[str] = None) -> Dict[str, Any]:
     """Re-run the archived proof through a solver.
 
@@ -332,10 +374,11 @@ def audit_receipt(receipt_file: str, replay: bool = True) -> Dict[str, Any]:
             checks.append("Receipt seal intact ({}...)".format(stored_seal[:16]))
 
     # 2. The source still hashes to what was verified.
-    source_file = data.get("source_file")
+    recorded_source = data.get("source_file")
+    source_file = resolve_recorded_path(receipt_file, recorded_source)
     expected_source = data.get("hashes", {}).get("dafny_source_sha256")
     if not source_file or not os.path.exists(source_file):
-        failures.append("source file not found: {}".format(source_file))
+        failures.append("source file not found: {}".format(source_file or recorded_source))
     else:
         current = compute_file_sha256(source_file)
         if current != expected_source:
@@ -348,7 +391,7 @@ def audit_receipt(receipt_file: str, replay: bool = True) -> Dict[str, Any]:
 
     # 3. The proof artifact, if the receipt claims one, is the one it claims.
     artifact = data.get("proof_artifact") or {}
-    smt2_path = artifact.get("smt2_file")
+    smt2_path = resolve_recorded_path(receipt_file, artifact.get("smt2_file"))
     recorded_proof = data.get("hashes", {}).get("smt2_proof_sha256")
     if not smt2_path:
         # Not a failure. A receipt that honestly records having no proof is
