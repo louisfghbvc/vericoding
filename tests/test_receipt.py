@@ -81,6 +81,36 @@ def test_generate_records_paths_relative_to_the_receipt(tmp_path, monkeypatch, t
     assert verify_receipt(str(receipt_file)) is True
 
 
+def test_audit_still_resolves_what_older_receipts_recorded(tmp_path, monkeypatch):
+    """Backward compatibility, because the alternative is a false alarm.
+
+    Receipts already issued record an absolute source path and a cwd-relative
+    artifact path. Refusing to resolve those would report an honest, sealed
+    receipt as a failed audit -- the same wrong answer this change exists to
+    remove, pointed the other way.
+    """
+    from scripts.receipt_generator import resolve_recorded_path
+
+    home = tmp_path / "sub"
+    home.mkdir()
+    receipt = home / "x.receipt.json"
+    receipt.write_text("{}")
+
+    beside = home / "beside.dfy"
+    beside.write_text("x")
+    assert resolve_recorded_path(str(receipt), "beside.dfy") == str(beside)
+
+    absolute = tmp_path / "absolute.dfy"
+    absolute.write_text("y")
+    assert resolve_recorded_path(str(receipt), str(absolute)) == str(absolute)
+
+    cwd_relative = tmp_path / "cwdrel.dfy"
+    cwd_relative.write_text("z")
+    monkeypatch.chdir(tmp_path)
+    assert os.path.samefile(
+        resolve_recorded_path(str(receipt), "cwdrel.dfy"), str(cwd_relative))
+
+
 def test_audit_rejects_a_forged_seal(tmp_path):
     """The seal used to be printed but never recomputed.
 
@@ -114,8 +144,12 @@ def test_audit_rejects_a_swapped_proof_artifact(tmp_path):
     """
     import shutil
 
+    from scripts.receipt_generator import resolve_recorded_path
+
     data = json.loads(open(_clean_receipt()).read())
-    artifact = data["proof_artifact"]["smt2_file"]
+    # Recorded relative to the receipt, so resolve it the way the auditor does
+    # rather than assuming the suite runs from the repository root.
+    artifact = resolve_recorded_path(_clean_receipt(), data["proof_artifact"]["smt2_file"])
     backup = tmp_path / "artifact.bak"
     shutil.copy(artifact, str(backup))
     try:
