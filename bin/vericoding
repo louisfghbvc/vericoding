@@ -14,6 +14,25 @@ Pipeline Stages:
 
 import os
 import sys
+
+# Checked before anything else is imported. scripts/receipt_generator.py uses
+# the walrus operator, so on an older interpreter the first symptom is a
+# SyntaxError pointing at line 35 of a file the user did not ask about -- which
+# reads as a bug in the code rather than a mismatch with the interpreter. This
+# block is deliberately written in syntax valid all the way back to 2.7 so that
+# it is the thing that runs, not the thing that fails to parse.
+MIN_PYTHON = (3, 8)
+if sys.version_info < MIN_PYTHON:
+    sys.stderr.write(
+        "vericoding needs Python %d.%d or newer; this is %d.%d (%s).\n"
+        "The floor is set by the walrus operator in scripts/receipt_generator.py.\n"
+        "Try a newer interpreter, e.g.  python3.11 %s ...\n"
+        % (MIN_PYTHON[0], MIN_PYTHON[1],
+           sys.version_info[0], sys.version_info[1], sys.executable,
+           os.path.basename(__file__))
+    )
+    sys.exit(2)
+
 import argparse
 import subprocess
 
@@ -24,7 +43,11 @@ if SCRIPT_DIR not in sys.path:
 
 def cmd_env(args):
     import check_env
-    check_env.print_report()
+    # Exit non-zero when this host cannot verify, so CI and scripts can branch
+    # on it without parsing the report. `env` used to always exit 0, which made
+    # it useless as a gate -- the one thing a diagnostic command is for.
+    ok = check_env.print_report(probe_targets=not args.no_targets)
+    sys.exit(0 if ok else 1)
 
 
 def cmd_score(args):
@@ -78,19 +101,114 @@ def cmd_receipt(args):
 
 def cmd_audit(args):
     import receipt_generator
-    ok = receipt_generator.verify_receipt(args.receipt)
-    sys.exit(0 if ok else 1)
+    result = receipt_generator.audit_receipt(args.receipt, replay=not args.no_replay)
+    # Three outcomes, for the same reason the verifier has four: "every check
+    # passed" and "a check could not be run" are different facts, and
+    # collapsing them into exit 0 is how an unverified proof comes to look
+    # like a verified one.
+    if result["failures"]:
+        sys.exit(1)
+    if result["notes"]:
+        sys.exit(2)
+    sys.exit(0)
+
+
+# Below this the specification is, by the scorer's own label, LOW confidence.
+# Chosen to match the band the tool already reports rather than invented here.
+DEFAULT_MIN_SCORE = 60
 
 
 def cmd_pipeline(args):
     print(">>> Starting Vericoding End-to-End Pipeline <<<\n")
-    print("[1/4] Running SMT Spec Scoring & Gap Analysis...")
+    print("[1/5] Running SMT Spec Scoring & Gap Analysis...")
     import spec_scorer
     scorer = spec_scorer.SpecScorer(args.file)
     res = scorer.analyze()
     print(f"  Spec Confidence: {res['overall_score']}% [{res['confidence_level']}]")
 
-    print("\n[2/4] Running DafnyPro Formal Verification...")
+    # The score used to be printed here and never read again. That made the
+    # scorer decorative in the one command where it matters most: a
+    # specification whose only postcondition can never fire verifies cleanly,
+    # compiles, and collects a cryptographic receipt, because no verifier can
+    # see that shape. Measured before this gate, end to end, exit 0:
+    #
+    #   Spec Confidence: 15.0% [LOW]
+    #   ✓ Formal verification succeeded!
+    #   ✓ Cryptographic Receipt Seal: 9219c342...
+    #   >>> Vericoding Pipeline Completed Successfully! Math, Not Vibes. <<<
+    #
+    # The scorer is the only thing standing between a vacuous spec and a
+    # signed receipt. Discarding its verdict removed the guard entirely.
+    vacuous = [c for m in res["methods"] for c in m.get("vacuous_clauses", [])]
+    blockers = []
+    if vacuous:
+        # Categorical, not a matter of degree: a clause that cannot fire
+        # protects nothing no matter what the rest of the spec scores.
+        blockers.append(
+            "{} vacuous clause(s) found: {}".format(
+                len(vacuous), "; ".join(vacuous[:3]) + ("; ..." if len(vacuous) > 3 else "")
+            )
+        )
+    if res["overall_score"] < args.min_score:
+        blockers.append(
+            "score {}% is below the --min-score threshold of {}%".format(
+                res["overall_score"], args.min_score
+            )
+        )
+
+    if blockers:
+        for blocker in blockers:
+            print(f"  ✗ {blocker}")
+        if not args.force:
+            print("\n  Stopping. A proof about this specification would be a proof")
+            print("  about the wrong thing. Run `vericoding score <file>` for the")
+            print("  gap report, or pass --force to continue anyway.")
+            sys.exit(1)
+        print("\n  --force given: continuing despite the above.")
+        print("  The receipt will record that this gate was overridden.")
+
+    spec_gate = {
+        "evaluated": True,
+        "score": res["overall_score"],
+        "confidence": res["confidence_level"],
+        "min_score": args.min_score,
+        "vacuous_clauses": vacuous,
+        "blockers": blockers,
+        "passed": not blockers,
+        "overridden": bool(blockers and args.force),
+        # An attestation, not a verification: the tool cannot know whether
+        # anyone read anything. Recording it is still worth more than not,
+        # because a receipt that omits it reads identically whether a human
+        # looked at the spec or nobody did.
+        "human_review_attested": bool(args.reviewed),
+    }
+
+    # Stage 4 of the documented methodology: a human reads the specification
+    # before anything is proved about it. The README advertised this and the
+    # pipeline had no such step -- it ran score, verify, compile, receipt
+    # straight through.
+    #
+    # That omission is not cosmetic. Every automated check in this repo
+    # answers "does the implementation satisfy the spec". None of them can
+    # answer "is this the right spec", and no solver ever will: a clause that
+    # says the wrong thing verifies exactly as cleanly as one that says the
+    # right thing. The human gate is the only place that question gets asked.
+    #
+    # It is an attestation, not a verification. The tool cannot know whether
+    # anyone read anything; it can record that someone said so, and refuse to
+    # continue until they do.
+    print("\n[2/5] Human Review of the Specification...")
+    if not args.reviewed:
+        print("  Stopping for review. The checks below this point all ask whether")
+        print("  the implementation satisfies the spec. None of them can tell you")
+        print("  the spec says the right thing.")
+        print("\n  Read:  templates/review_checklist.md")
+        print(f"  And:   vericoding score {args.file}")
+        print("\n  Then re-run with --reviewed to record that you did and continue.")
+        sys.exit(3)
+    print("  ✓ Review attested by the caller (--reviewed)")
+
+    print("\n[3/5] Running DafnyPro Formal Verification...")
     import verify_loop
     verifier = verify_loop.DafnyVerifier()
     v_res = verifier.verify(args.file)
@@ -100,7 +218,7 @@ def cmd_pipeline(args):
         sys.exit(1)
     print("  ✓ Formal verification succeeded!")
 
-    print(f"\n[3/4] Compiling to Target Language: {args.target}...")
+    print(f"\n[4/5] Compiling to Target Language: {args.target}...")
     import compiler
     c = compiler.DafnyCompiler()
     c_res = c.compile(args.file, target=args.target, output_dir=args.out)
@@ -109,10 +227,10 @@ def cmd_pipeline(args):
         sys.exit(1)
     print(f"  ✓ Target compiled into: {c_res['output_dir']}")
 
-    print("\n[4/4] Archiving Proof Receipt & Cryptographic Seal...")
+    print("\n[5/5] Archiving Proof Receipt & Cryptographic Seal...")
     import receipt_generator
     rg = receipt_generator.ReceiptGenerator()
-    r_res = rg.generate(args.file, nl_intent=args.intent)
+    r_res = rg.generate(args.file, nl_intent=args.intent, spec_gate=spec_gate)
     print(f"  ✓ Cryptographic Receipt Seal: {r_res['receipt_seal_sha256']}")
     print("\n>>> Vericoding Pipeline Completed Successfully! Math, Not Vibes. <<<")
 
@@ -126,6 +244,8 @@ def main():
 
     # env
     p_env = sub.add_parser("env", help="Check verification and compilation toolchain environment")
+    p_env.add_argument("--no-targets", action="store_true",
+                       help="skip the per-target build probes; verification is still probed")
     p_env.set_defaults(func=cmd_env)
 
     # score
@@ -159,6 +279,11 @@ def main():
     # audit
     p_audit = sub.add_parser("audit", help="Audit an existing receipt against local source")
     p_audit.add_argument("receipt", help="Path to .receipt.json file")
+    p_audit.add_argument(
+        "--no-replay", action="store_true",
+        help="skip re-running the archived proof through the solver "
+             "(hashes are still checked; the proof is then unverified here)",
+    )
     p_audit.set_defaults(func=cmd_audit)
 
     # pipeline
@@ -167,6 +292,20 @@ def main():
     p_pipeline.add_argument("--target", default="py", help="Target language (py, go, js, cs)")
     p_pipeline.add_argument("--intent", default=None, help="Natural language intent description")
     p_pipeline.add_argument("--out", default=None, help="Output directory for compilation")
+    p_pipeline.add_argument(
+        "--min-score", type=int, default=DEFAULT_MIN_SCORE,
+        help="refuse to proceed below this spec confidence (default: %(default)s, "
+             "the bottom of the scorer's MODERATE band)",
+    )
+    p_pipeline.add_argument(
+        "--reviewed", action="store_true",
+        help="attest that a human has read the specification (methodology "
+             "stage 4); the pipeline stops before verification without it",
+    )
+    p_pipeline.add_argument(
+        "--force", action="store_true",
+        help="proceed even when the spec gate fails; the override is recorded",
+    )
     p_pipeline.set_defaults(func=cmd_pipeline)
 
     args = parser.parse_args()

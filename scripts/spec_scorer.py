@@ -23,11 +23,146 @@ except ImportError:
     z3 = None
 
 
+CLAUSE_KEYWORDS = ("requires", "ensures", "modifies", "reads", "decreases", "invariant")
+
+# One clause runs from its keyword up to the next clause keyword or the body,
+# NOT up to the next newline. A newline boundary silently truncates any clause
+# a human wrapped for readability -- `ensures y == x &&` is not a shorter
+# version of the clause, it is a broken fragment that the vacuity analysis then
+# tries to interpret.
+_CLAUSE_RE = re.compile(
+    r'\b(' + '|'.join(CLAUSE_KEYWORDS) + r')\b\s+(.*?)'
+    r'(?=\b(?:' + '|'.join(CLAUSE_KEYWORDS) + r')\b|$)',
+    re.DOTALL,
+)
+
+
+def strip_comments(text: str) -> str:
+    """Remove Dafny comments while preserving everything else's position.
+
+    This is not cosmetic. Without it the parser reads commented-out clauses as
+    real ones, and the effect runs the wrong way: adding
+
+        // ensures y > 0
+        // ensures y != -1
+
+    to a spec changed nothing about what it guarantees but moved its score from
+    70% MODERATE to 85% HIGH. Commenting a clause out increased confidence.
+
+    String and char literals are honoured so that a `//` inside one survives,
+    and block comments nest, as they do in Dafny. Newlines inside removed
+    regions are kept so that line-based reasoning elsewhere still lines up.
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+
+        if ch in '"\'':
+            quote, j = ch, i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == quote:
+                    j += 1
+                    break
+                j += 1
+            out.append(text[i:j])
+            i = j
+
+        elif text.startswith('//', i):
+            end = text.find('\n', i)
+            i = n if end == -1 else end          # keep the newline itself
+
+        elif text.startswith('/*', i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith('/*', j):
+                    depth += 1
+                    j += 2
+                elif text.startswith('*/', j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            out.append('\n' * text.count('\n', i, j))
+            i = j
+
+        else:
+            out.append(ch)
+            i += 1
+
+    return ''.join(out)
+
+
+def _wraps_whole(text: str) -> bool:
+    """True when the leading `(` is closed by the trailing `)`.
+
+    `(a) && (b)` is balanced and starts and ends with parens, but the first
+    one closes in the middle -- stripping them yields `a) && (b`. Only a scan
+    distinguishes that from `(a && b)`.
+    """
+    depth = 0
+    for index, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return index == len(text) - 1
+    return False
+
+
+# Band boundaries for the reported confidence level. Named because the
+# scoring refers to them: a method with a clause the analyser could not read
+# is capped just below HIGH, since "high confidence" is precisely the claim
+# an unread clause does not support.
+HIGH_CONFIDENCE_MIN = 85
+MODERATE_CONFIDENCE_MIN = 60
+
+
+def _split_top_level(text: str, separator: str):
+    """Split on `separator`, ignoring occurrences inside parentheses.
+
+    `re.split` cannot do this: it breaks `(a || b) && c` at the `&&` correctly
+    but breaks `f(a && b) > 0` in the middle of an argument list. Depth is the
+    only thing that distinguishes them.
+    """
+    parts, depth, current = [], 0, []
+    index, width, length = 0, len(separator), len(text)
+    while index < length:
+        ch = text[index]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if depth == 0 and text.startswith(separator, index):
+            parts.append("".join(current))
+            current = []
+            index += width
+            continue
+        current.append(ch)
+        index += 1
+    parts.append("".join(current))
+    return [p for p in (part.strip() for part in parts) if p]
+
+
+def _unwrap_parens(text: str) -> str:
+    """Remove parentheses that wrap the whole expression, however many."""
+    text = text.strip()
+    while text.startswith("(") and text.endswith(")") and _wraps_whole(text):
+        text = text[1:-1].strip()
+    return text
+
+
 class DafnySpecParser:
     """Extracts methods, requires, ensures, and modifies clauses from Dafny code."""
 
     def __init__(self, content: str):
-        self.content = content
+        # Comments are removed once, up front, so nothing downstream has to
+        # remember to do it.
+        self.content = strip_comments(content)
         self.methods = self._parse_methods()
 
     def _parse_methods(self) -> List[Dict[str, Any]]:
@@ -50,13 +185,16 @@ class DafnySpecParser:
             spec_block_match = re.search(r'\{', rest)
             spec_text = rest[:spec_block_match.start()] if spec_block_match else rest[:300]
 
-            # In Dafny, clauses may or may not end with semicolon, typically end of line
-            clause_pattern = re.compile(r'(requires|ensures|modifies)\s+([^{\n]+?)(?:;|\n|$)')
             requires = []
             ensures = []
             modifies = []
-            for c_match in clause_pattern.finditer(spec_text):
-                c_type, c_val = c_match.group(1), c_match.group(2).strip()
+            for c_match in _CLAUSE_RE.finditer(spec_text):
+                c_type = c_match.group(1)
+                # Collapse the wrapping a human added for readability; a clause
+                # spanning three lines is one clause, not a truncated one.
+                c_val = " ".join(c_match.group(2).split()).rstrip(";").strip()
+                if not c_val:
+                    continue
                 if c_type == "requires":
                     requires.append(c_val)
                 elif c_type == "ensures":
@@ -72,8 +210,28 @@ class DafnySpecParser:
                 "requires": [r.strip() for r in requires],
                 "ensures": [e.strip() for e in ensures],
                 "modifies": [m.strip() for m in modifies],
+                # The body is captured because vacuity can live there too, not
+                # only in the clauses -- see BODY_VACUITY_RE below.
+                "body": self._extract_body(rest, spec_block_match),
             })
         return methods
+
+    @staticmethod
+    def _extract_body(rest: str, spec_block_match) -> str:
+        """Return the method body, brace-balanced, or '' if there is none."""
+        if not spec_block_match:
+            return ""
+        start = spec_block_match.start()
+        depth, i = 0, start
+        while i < len(rest):
+            if rest[i] == "{":
+                depth += 1
+            elif rest[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return rest[start + 1:i]
+            i += 1
+        return rest[start + 1:]
 
 
 class SpecScorer:
@@ -108,9 +266,9 @@ class SpecScorer:
         avg_score = round(total_score / len(self.parser.methods), 1)
         results["overall_score"] = avg_score
 
-        if avg_score >= 85:
+        if avg_score >= HIGH_CONFIDENCE_MIN:
             results["confidence_level"] = "HIGH"
-        elif avg_score >= 60:
+        elif avg_score >= MODERATE_CONFIDENCE_MIN:
             results["confidence_level"] = "MODERATE"
         else:
             results["confidence_level"] = "LOW"
@@ -124,6 +282,34 @@ class SpecScorer:
         gaps = []
         strengths = []
         score = 50  # baseline
+
+        # Body-level vacuity, checked first because it makes every clause
+        # below meaningless no matter how well written they are. `assume
+        # false;` renders the rest of the method unreachable, so every
+        # postcondition verifies against any implementation -- and the scorer
+        # used to miss it entirely, because it only ever read clauses. A spec
+        # with `assume false;` and a deliberately wrong body scored 85% HIGH
+        # and was told its preconditions were free of vacuity.
+        #
+        # This matters most here rather than in verify_loop: `score` is the
+        # stage a human uses to decide whether to approve a specification.
+        body_vacuity = self._check_body_vacuity(method)
+        if body_vacuity:
+            return {
+                "method_name": method["name"],
+                "score": 0,
+                "strengths": [],
+                "gaps": [{
+                    "category": "Body Vacuity",
+                    "status": "VACUOUS",
+                    "message": body_vacuity,
+                }],
+                "raw_requires": method["requires"],
+                "raw_ensures": method["ensures"],
+                "live_ensures": [],
+                "vacuous_clauses": list(method["ensures"]),
+                "unanalysed_clauses": [],
+            }
 
         # Vacuity first, because it decides what the other counts MEAN. The
         # original scoring counted every `ensures` as evidence of rigour, which
@@ -211,9 +397,22 @@ class SpecScorer:
             })
             score -= 20
 
-        # 2c. Anything the analyser could not read is reported, never credited.
-        # Scoring an unread clause as sound is the same mistake this tool
-        # exists to catch.
+        # 2c. Anything the analyser could not read is reported, never credited,
+        # and costs exactly what a vacuous clause costs.
+        #
+        # Not crediting it is not enough. Vacuous was -20 and unanalysed was 0,
+        # so ANY failure to read a clause was worth 20 points more than reading
+        # it and finding it hollow -- and the cheapest way to get there is for
+        # the solver to fall over. Measured on a spec with one vacuous
+        # postcondition: 15 with a working z3, 30 with a broken one. Breaking
+        # the analyser improved the score.
+        #
+        # On the evidence available, an unanalysed clause is indistinguishable
+        # from a vacuous one; that is what "not analysed" means. Scoring it as
+        # the better of the two possibilities is a claim the check did not
+        # earn. The gap list still distinguishes NOT ANALYSED from VACUOUS, so
+        # a human reviewer sees which is which -- but the number that feeds the
+        # gate does not improve because the tool went blind.
         for u in unanalysed_ensures:
             clause = u["clause"] if isinstance(u, dict) else u
             why = u.get("why", "") if isinstance(u, dict) else ""
@@ -222,6 +421,7 @@ class SpecScorer:
                 "status": "NOT ANALYSED",
                 "message": f"`{clause}` was not checked for vacuity" + (f" — {why}" if why else "")
             })
+            score -= 20
 
         # 3. Check failure branch handling. Only live clauses count -- a
         # vacuous clause mentioning "fail" is not failure coverage.
@@ -246,9 +446,28 @@ class SpecScorer:
         # awarded the same credit for "no contradiction found" as for "checked
         # and sound", which let an unparsed spec collect points for silence.
         if smt_check.get("analysed"):
-            strengths.append("Preconditions are jointly satisfiable (no Shape-A vacuity).")
-            score += 5
-            for expr in smt_check.get("unparsed", []):
+            # The claim has to be no stronger than the check. When a clause was
+            # outside the fragment the solver never saw it, so "the
+            # preconditions are jointly satisfiable" is not what was
+            # established -- only that the readable SUBSET is. If the excluded
+            # clause is itself unsatisfiable (`requires Valid(s)` where Valid
+            # is false everywhere) the unqualified claim is simply wrong, and
+            # it is wrong in the flattering direction. The gap list said
+            # NOT ANALYSED all along; the strengths line contradicted it in
+            # the one place a reader skims.
+            unparsed = smt_check.get("unparsed", [])
+            if unparsed:
+                checked = smt_check.get("parsed_count", 0)
+                strengths.append(
+                    "The {} expressible precondition(s) are jointly satisfiable; "
+                    "{} not analysed, so Shape-A vacuity is not ruled out.".format(
+                        checked, len(unparsed))
+                )
+                score += 2   # a partial check is worth less than a whole one
+            else:
+                strengths.append("Preconditions are jointly satisfiable (no Shape-A vacuity).")
+                score += 5
+            for expr in unparsed:
                 gaps.append({
                     "category": "Coverage",
                     "status": "NOT ANALYSED",
@@ -264,6 +483,26 @@ class SpecScorer:
             })
 
         final_score = max(0, min(100, score))
+
+        # A spec with an unread clause cannot reach the band that means
+        # "fully established".
+        #
+        # Without this the bundled example printed
+        #
+        #     Spec Confidence  : 100.0% [HIGH]
+        #     ? [NOT ANALYSED] precondition `Valid()` was not expressible ...
+        #
+        # -- a headline of complete confidence directly above the note saying
+        # part of the spec was never checked. The per-clause penalties were
+        # there and correct; the clamp at 100 swallowed them, because these
+        # methods scored well past the ceiling on their other merits. A cap is
+        # the only thing that survives the clamp.
+        #
+        # The number is the band boundary rather than a tuned constant: the
+        # claim being withheld is specifically "HIGH", and the gap list still
+        # says exactly which clause went unread.
+        if any(g["status"] == "NOT ANALYSED" for g in gaps):
+            final_score = min(final_score, HIGH_CONFIDENCE_MIN - 1)
 
         return {
             "method_name": method["name"],
@@ -320,7 +559,14 @@ class SpecScorer:
     RE_ATOM = re.compile(
         r'^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(>=|<=|==|!=|>|<)\s*(-?\d+|[a-zA-Z_][a-zA-Z0-9_]*)\s*$'
     )
-    RE_IMPLIES = re.compile(r'^(.*?)==>(.*)$')
+    # `<==>` contains `==>`. Without the lookbehind, `ensures ok <==> x > 10`
+    # matched as an implication with the antecedent `ok <`, which parses as
+    # nothing -- so a correct, constraining biconditional was reported as
+    # unanalysed, counted as zero live postconditions, and told "no
+    # postcondition that can ever fire". It scored 15. A biconditional has no
+    # antecedent to be vacuous, so declining to match it here is also the
+    # right answer, not just a narrower one.
+    RE_IMPLIES = re.compile(r'^(.*?)(?<!<)==>(.*)$')
     TRIVIALLY_TRUE = {"true"}
     TRIVIALLY_FALSE = {"false"}
 
@@ -350,8 +596,16 @@ class SpecScorer:
         bool_match = self.RE_BOOL_ATOM.match(text)
         if bool_match:
             negated, name = bool_match.groups()
-            if name.lower() in self.TRIVIALLY_TRUE or name.lower() in self.TRIVIALLY_FALSE:
-                return None  # handled by the caller's literal checks
+            low = name.lower()
+            # Literals are translated here rather than deferred to the caller.
+            # Deferring meant the caller's checks -- which only ever saw the
+            # bare forms -- let `!true` through as unparsed, so `requires
+            # !true` was reported NOT ANALYSED and scored 65 while the
+            # identical `requires false` scored 0. A negation is not a reason
+            # to stop understanding a literal.
+            if low in self.TRIVIALLY_TRUE or low in self.TRIVIALLY_FALSE:
+                value = low in self.TRIVIALLY_TRUE
+                return z3.BoolVal(not value if negated else value)
             var = bool_map.setdefault(name, z3.Bool(name))
             return z3.Not(var) if negated else var
 
@@ -360,29 +614,93 @@ class SpecScorer:
     def _conjunction(self, text: str, var_map: Dict[str, Any],
                      bool_map: Dict[str, Any]):
         """Translate `a && b && c`, returning (terms, unparsed_parts)."""
-        # Strip one layer of wrapping parentheses so `(a && b)` parses.
-        text = text.strip()
-        while text.startswith("(") and text.endswith(")") and text.count("(") == text.count(")"):
-            inner = text[1:-1].strip()
-            if inner.count("(") != inner.count(")"):
-                break
-            text = inner
+        # Strip wrapping parentheses so `(a && b)` parses.
+        #
+        # Counting parens cannot do this. For `(x > 0) && (x < 5)` the counts
+        # match, the string starts with "(" and ends with ")", and the inner
+        # slice `x > 0) && (x < 5` ALSO has matching counts -- so the old
+        # check passed twice over and handed the splitter mangled text. Both
+        # conjuncts then failed to parse and an entirely idiomatic Dafny
+        # precondition came back NOT ANALYSED, taking the Shape-A check with
+        # it. The question is not "are the parens balanced" but "does the
+        # FIRST one close at the very end", which needs a scan.
+        text = _unwrap_parens(text)
 
-        parts = [p.strip() for p in re.split(r'&&', text) if p.strip()]
+        # And again per conjunct: declining to strip `(a) && (b)` as a whole is
+        # correct, but it leaves each conjunct wearing its own parens, which
+        # `_atom` cannot read either. Unwrapping only the outside fixed the
+        # mangling and left the clause just as unanalysed.
+        parts = [_unwrap_parens(p) for p in _split_top_level(text, "&&")]
         terms, unparsed = [], []
         for part in parts:
-            low = part.strip().lower()
-            if low in self.TRIVIALLY_TRUE:
+            # A disjunct is not an atom. Handing `a || b` straight to `_atom`
+            # makes it unparsed, which now costs a clause 20 points -- so an
+            # ordinary `requires x > 0 || y > 0` was penalised for being
+            # ordinary.
+            if len(_split_top_level(part, "||")) > 1:
+                or_terms, or_unparsed = self._disjunction(part, var_map, bool_map)
+                if or_unparsed:
+                    unparsed.extend(or_unparsed)
+                else:
+                    terms.append(or_terms)
                 continue
-            if low in self.TRIVIALLY_FALSE:
-                terms.append(z3.BoolVal(False))
-                continue
+            # Literals are `_atom`'s job now. Keeping a second copy of the
+            # rule here is what let `!true` slip between them: this loop
+            # matched only the bare spellings and `_atom` deferred to this
+            # loop, so the negated form belonged to neither. One place
+            # understands literals.
             atom = self._atom(part, var_map, bool_map)
             if atom is None:
                 unparsed.append(part)
             else:
                 terms.append(atom)
         return terms, unparsed
+
+    def _disjunction(self, text: str, var_map: Dict[str, Any],
+                     bool_map: Dict[str, Any]):
+        """Translate `a || b || c` into one Or term, or report it unparsed.
+
+        All or nothing, and the asymmetry with `_conjunction` is deliberate.
+        Dropping a conjunct the fragment cannot read makes the constraint
+        WEAKER: the solver may then find a model that the real precondition
+        forbids, so a genuine contradiction goes unnoticed. That is a missed
+        finding, and it is already reported as NOT ANALYSED.
+
+        Dropping a disjunct makes the constraint STRONGER. `x > 0 || f(y)`
+        reduced to `x > 0` rules out states the spec allows, and if the
+        remaining terms happen to be unsatisfiable the check reports
+        CONTRADICTION -- a vacuity finding against a specification that has
+        none. A false accusation is worse than a missed one here: it is the
+        one output a reader cannot audit without redoing the work by hand.
+        """
+        disjuncts = [_unwrap_parens(p) for p in _split_top_level(text, "||")]
+        terms = []
+        for disjunct in disjuncts:
+            sub_terms, sub_unparsed = self._conjunction(disjunct, var_map, bool_map)
+            if sub_unparsed or not sub_terms:
+                return None, [text]
+            terms.append(sub_terms[0] if len(sub_terms) == 1 else z3.And(*sub_terms))
+        return z3.Or(*terms), []
+
+    # `assume false` is the body-level equivalent of `requires false`: it makes
+    # everything after it unreachable, so every postcondition holds for any
+    # implementation. `assert false` reaches the same state by a different
+    # route. Both are legitimate mid-proof tools in narrow cases, which is
+    # exactly why they need to be surfaced rather than silently tolerated in a
+    # specification a human is about to approve.
+    BODY_VACUITY_RE = re.compile(r'\b(assume|assert)\s+false\s*;')
+
+    def _check_body_vacuity(self, method: Dict[str, Any]):
+        """Return a message if the body makes the contract unfalsifiable."""
+        match = self.BODY_VACUITY_RE.search(method.get("body", "") or "")
+        if not match:
+            return None
+        return (
+            "`{}` in the body makes everything after it unreachable, so every "
+            "postcondition above holds for ANY implementation -- including a "
+            "wrong one. The proof will succeed and guarantee nothing. If this "
+            "is a contract stub, leave the body empty instead."
+        ).format(match.group(0))
 
     def _check_smt_vacuity(self, method: Dict[str, Any]) -> Dict[str, Any]:
         """Shape A: are the preconditions jointly satisfiable?"""
@@ -421,21 +739,31 @@ class SpecScorer:
                     "detail": "the requires clauses have no common solution (unsat), "
                               "so the method is unreachable and any body verifies",
                 }
+            # parsed_count is how many assertions the solver actually reasoned
+            # over. The caller needs it to state the sat result at the strength
+            # the check earned, rather than generalising it to clauses the
+            # solver never saw.
             return {"analysed": True, "has_contradiction": False,
-                    "unparsed": unparsed_total}
+                    "unparsed": unparsed_total,
+                    "parsed_count": len(solver.assertions())}
         except Exception as ex:
             return {"analysed": False, "note": str(ex)}
 
     def _check_ensures_vacuity(self, method: Dict[str, Any]) -> Dict[str, Any]:
         """Shape B: can each postcondition's antecedent ever hold?"""
         result = {"vacuous": [], "unanalysed": [], "live": []}
-        if not z3:
-            result["unanalysed"] = list(method["ensures"])
-            return result
 
         for ens in method["ensures"]:
             body = ens.strip()
 
+            # The two blatant forms need no solver: `ensures true` and
+            # `ensures X ==> true` are vacuous by reading, not by proving.
+            # _check_smt_vacuity already catches `requires false` ahead of the
+            # solver for exactly this reason, and leaving the mirror shapes
+            # behind the z3 guard made the report's verdict depend on whether
+            # a package happened to be installed -- on a host without z3 the
+            # textbook Shape-B spec came back "not checked" rather than
+            # "vacuous", which is honest but weaker than the evidence allowed.
             if body.lower() in self.TRIVIALLY_TRUE:
                 result["vacuous"].append({
                     "clause": ens,
@@ -444,20 +772,29 @@ class SpecScorer:
                 continue
 
             implies = self.RE_IMPLIES.match(body)
-            if not implies:
-                # Not an implication, so there is no antecedent to be vacuous.
-                result["live"].append(ens)
-                continue
-
-            antecedent, consequent = implies.group(1).strip(), implies.group(2).strip()
-
-            if consequent.lower() in self.TRIVIALLY_TRUE:
+            if implies and implies.group(2).strip().lower() in self.TRIVIALLY_TRUE:
                 result["vacuous"].append({
                     "clause": ens,
                     "why": "the consequent is literally `true`, so the implication "
                            "holds for every input regardless of the antecedent",
                 })
                 continue
+
+            if not implies:
+                # Not an implication, so there is no antecedent to be vacuous.
+                # Also decidable by reading.
+                result["live"].append(ens)
+                continue
+
+            if not z3:
+                # Only the remaining question -- can this antecedent ever hold
+                # under the preconditions? -- needs a solver. Unanalysed, not
+                # live: a clause nobody checked must not be counted as one
+                # that can fire.
+                result["unanalysed"].append(ens)
+                continue
+
+            antecedent, consequent = implies.group(1).strip(), implies.group(2).strip()
 
             try:
                 var_map: Dict[str, Any] = {}

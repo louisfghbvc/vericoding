@@ -1,24 +1,16 @@
-import os
-import pytest
 from scripts.verify_loop import DafnyVerifier
 
 
-def test_verifier_pass():
+def test_verifier_pass(toolchain):
     verifier = DafnyVerifier()
-    if not verifier.is_available():
-        pytest.skip("Dafny CLI not installed")
-
     res = verifier.verify("examples/bank_account/bank.dfy")
     assert res["success"] is True
     assert res["verified"] is True
     assert len(res["diagnostics"]) == 0
 
 
-def test_verifier_failure(tmp_path):
+def test_verifier_failure(tmp_path, toolchain):
     verifier = DafnyVerifier()
-    if not verifier.is_available():
-        pytest.skip("Dafny CLI not installed")
-
     failing_dfy = tmp_path / "fail.dfy"
     failing_dfy.write_text("""
     method Wrong(x: int) returns (y: int)

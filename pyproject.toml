@@ -1,0 +1,30 @@
+# Vericoding is installed as a skill package (install.sh symlinks this tree
+# into the agent skill directories), not as a pip distribution -- so there is
+# deliberately no [build-system] table here. This file exists for one reason:
+# to state the Python version this code actually needs, in the place tools
+# look for it.
+#
+# The floor is 3.8, set by the walrus operator at
+# scripts/receipt_generator.py:35. Measured: every other file in scripts/ and
+# bin/ compiles cleanly under 3.6, and only that one does not:
+#
+#   $ for f in bin/vericoding scripts/*.py; do python3.6 -m py_compile $f; done
+#   receipt_generator.py -> SyntaxError
+#
+# Without this declaration the failure surfaced as a bare SyntaxError pointing
+# at a line of code, which reads as a bug in the file rather than a mismatch
+# with the interpreter. bin/vericoding now also checks at startup and says so
+# in one line.
+
+[project]
+name = "vericoding"
+version = "0.1.0"
+description = "Formally verified AI code synthesis using Dafny and SMT solvers (Z3)"
+requires-python = ">=3.8"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The suite does `from scripts.x import y`. That resolves today only because
+# pytest prepends the rootdir to sys.path; naming it here makes the dependency
+# explicit rather than incidental.
+pythonpath = ["."]

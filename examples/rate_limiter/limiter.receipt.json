@@ -1,6 +1,6 @@
 {
   "schema_version": "vericoding.proof.v1",
-  "timestamp_utc": "2026-09-14T10:06:18Z",
+  "timestamp_utc": "2026-09-15T09:12:25Z",
   "source_file": "/home/scratch.louiliu_vlsi_1/sideProject/vericoding/examples/rate_limiter/limiter.dfy",
   "hashes": {
     "natural_language_intent_sha256": "e5984b90e1a91a7972608b944cd12a724033ff00ff1084bd59dabe5c64c8312f",
@@ -9,7 +9,7 @@
   },
   "formal_verification": {
     "verified": true,
-    "duration_seconds": 1.238,
+    "duration_seconds": 1.048,
     "solver_backend": "Z3 / SMT-LIB2",
     "errors_count": 0,
     "diagnostics": []
@@ -19,6 +19,16 @@
     "z3_version": "5.1.0",
     "platform": "linux"
   },
+  "spec_gate": {
+    "evaluated": true,
+    "score": 100.0,
+    "confidence": "HIGH",
+    "min_score": 60,
+    "vacuous_clauses": [],
+    "blockers": [],
+    "passed": true,
+    "overridden": false
+  },
   "proof_artifact": {
     "smt2_file": "examples/rate_limiter/limiter.smt2",
     "replayable": true,
@@ -26,5 +36,5 @@
     "assertion_count": 270,
     "audit_command": "z3 limiter.smt2"
   },
-  "receipt_seal_sha256": "e03b90020e51aad8d3aaa6c4eedd125c3ecdbe2fdf2a62378ab10543829ae55b"
+  "receipt_seal_sha256": "9bc78aeeac2aa06b532430e0360780b10dbf17010fd09fc420b9ad95cf7e234f"
 }

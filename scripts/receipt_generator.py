@@ -13,6 +13,7 @@ import sys
 import json
 import time
 import hashlib
+import shutil
 import argparse
 import subprocess
 from typing import Dict, Any, Optional
@@ -23,6 +24,10 @@ try:
 except ImportError:
     from scripts.verify_loop import DafnyVerifier
     from scripts.check_env import run_diagnostics
+
+
+# Generous: a real Dafny proof log is tens of thousands of assertions.
+REPLAY_TIMEOUT_S = 300
 
 
 def compute_sha256(content: str) -> str:
@@ -46,7 +51,8 @@ class ReceiptGenerator:
         file_path: str,
         nl_intent: Optional[str] = None,
         output_receipt_path: Optional[str] = None,
-        dump_smt: bool = True
+        dump_smt: bool = True,
+        spec_gate: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -94,6 +100,12 @@ class ReceiptGenerator:
                 "z3_version": env_diag["z3_python"]["version"] or env_diag["z3_cli"]["version"],
                 "platform": sys.platform,
             },
+            # What the specification gate said, and whether someone went past
+            # it. A receipt that omits this reads identically whether the spec
+            # passed on its merits or was forced through at 15% with a vacuous
+            # clause -- and the second case is exactly the one a reader needs
+            # to know about. Sealed with the rest, so it cannot be edited out.
+            "spec_gate": spec_gate or {"evaluated": False},
             "proof_artifact": {
                 "smt2_file": smt_artifact_path,
                 # Never assert replayability we have not demonstrated. An
@@ -217,29 +229,189 @@ class ReceiptGenerator:
         }
 
 
-def verify_receipt(receipt_file: str) -> bool:
-    """Verifies that an archived receipt accurately reflects the local code and verification state."""
+def recompute_seal(data: Dict[str, Any]) -> str:
+    """Recompute a receipt's seal exactly as `generate` produced it.
+
+    The seal covers the receipt with the seal key itself removed, so this must
+    mirror generate()'s ordering or every receipt will look tampered with.
+    """
+    body = {k: v for k, v in data.items() if k != "receipt_seal_sha256"}
+    return compute_sha256(json.dumps(body, sort_keys=True))
+
+
+def replay_proof(smt2_path: str, solver_path: Optional[str] = None) -> Dict[str, Any]:
+    """Re-run the archived proof through a solver.
+
+    This is the property the whole method rests on: the artifact is portable
+    SMT-LIB2, so anyone can check it without trusting this pipeline, this
+    machine, or the model that wrote the code. Until something actually runs
+    it, "replayable: true" is a claim about a file nobody has opened.
+
+    Returns `checked: False` and a reason when nothing ran, and deliberately
+    carries NO `ok` key in that case. `ok: False` would read as "the proof
+    failed" where the truth is "nothing was checked", and the caller routes
+    those differently -- one is a failure, the other a note. Adding the key
+    for symmetry is the obvious tidy-up and would collapse the distinction.
+
+    A genuine Dafny proof log asks the solver to refute the negation of each
+    obligation, so every `(check-sat)` must answer `unsat`. A single `sat`
+    means an obligation was satisfiable in its negated form -- the proof does
+    not hold. The stub this generator used to fabricate answers `sat` for a
+    different reason (an empty query is trivially satisfiable), and is caught
+    by the same check.
+    """
+    solver = solver_path or os.environ.get("VERICODING_Z3") or shutil.which("z3")
+    if not solver:
+        return {"checked": False, "reason": "no z3 on PATH and VERICODING_Z3 unset"}
+    if not os.path.exists(smt2_path):
+        return {"checked": False, "reason": f"artifact missing: {smt2_path}"}
+
+    try:
+        proc = subprocess.run(
+            [solver, smt2_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=REPLAY_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return {"checked": False, "reason": f"solver timed out after {REPLAY_TIMEOUT_S}s"}
+    except Exception as ex:
+        return {"checked": False, "reason": str(ex)}
+
+    answers = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    verdicts = [a for a in answers if a in ("sat", "unsat", "unknown")]
+    if not verdicts:
+        return {"checked": False, "reason": "solver produced no sat/unsat answer"}
+
+    bad = [v for v in verdicts if v != "unsat"]
+    return {
+        "checked": True,
+        "ok": not bad,
+        "checks": len(verdicts),
+        "solver": solver,
+        "reason": None if not bad else (
+            "{} of {} obligation(s) did not discharge: {}".format(
+                len(bad), len(verdicts), ", ".join(sorted(set(bad)))
+            )
+        ),
+    }
+
+
+def audit_receipt(receipt_file: str, replay: bool = True) -> Dict[str, Any]:
+    """Check that a receipt still describes the code and the proof beside it.
+
+    Every line this prints corresponds to something that was checked. That is
+    not a stylistic preference -- the previous version printed three green
+    checkmarks while validating exactly one thing:
+
+      * "Receipt Seal: <hash>" printed the stored seal without recomputing it,
+        so replacing it with 64 zeros produced a green line and exit 0.
+      * The proof artifact was never examined, so corrupting
+        hashes.smt2_proof_sha256 also passed.
+
+    A receipt is a claim about three artifacts -- the source, the proof, and
+    itself. Checking one of them and reporting on three is the same defect the
+    stub proof artifact was: authority that has not been earned.
+    """
     with open(receipt_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    checks, failures, notes = [], [], []
+
+    # 1. The receipt has not been edited since it was issued.
+    stored_seal = data.get("receipt_seal_sha256")
+    if not stored_seal:
+        failures.append("receipt carries no seal")
+    else:
+        actual_seal = recompute_seal(data)
+        if actual_seal != stored_seal:
+            failures.append(
+                "receipt seal mismatch -- the receipt was edited after issuance\n"
+                "    recorded: {}\n    actual  : {}".format(stored_seal, actual_seal)
+            )
+        else:
+            checks.append("Receipt seal intact ({}...)".format(stored_seal[:16]))
+
+    # 2. The source still hashes to what was verified.
     source_file = data.get("source_file")
+    expected_source = data.get("hashes", {}).get("dafny_source_sha256")
     if not source_file or not os.path.exists(source_file):
-        print(f"✗ Source file not found: {source_file}")
-        return False
+        failures.append("source file not found: {}".format(source_file))
+    else:
+        current = compute_file_sha256(source_file)
+        if current != expected_source:
+            failures.append(
+                "source changed since issuance\n"
+                "    recorded: {}\n    actual  : {}".format(expected_source, current)
+            )
+        else:
+            checks.append("Source matches ({}...)".format(current[:12]))
 
-    current_hash = compute_file_sha256(source_file)
-    expected_hash = data.get("hashes", {}).get("dafny_source_sha256")
+    # 3. The proof artifact, if the receipt claims one, is the one it claims.
+    artifact = data.get("proof_artifact") or {}
+    smt2_path = artifact.get("smt2_file")
+    recorded_proof = data.get("hashes", {}).get("smt2_proof_sha256")
+    if not smt2_path:
+        # Not a failure. A receipt that honestly records having no proof is
+        # still a valid receipt -- it just cannot claim a verified artifact.
+        checks.append(
+            "No proof artifact claimed ({})".format(
+                artifact.get("reason") or "reason not recorded"
+            )
+        )
+    elif not os.path.exists(smt2_path):
+        failures.append("receipt names a proof artifact that is missing: {}".format(smt2_path))
+    else:
+        actual_proof = compute_file_sha256(smt2_path)
+        if actual_proof != recorded_proof:
+            failures.append(
+                "proof artifact changed since issuance: {}\n"
+                "    recorded: {}\n    actual  : {}".format(
+                    smt2_path, recorded_proof, actual_proof)
+            )
+        else:
+            checks.append("Proof artifact matches ({}...)".format(actual_proof[:12]))
 
-    if current_hash != expected_hash:
-        print(f"✗ Cryptographic Hash Mismatch!")
-        print(f"  Expected: {expected_hash}")
-        print(f"  Actual  : {current_hash}")
-        return False
+            # A matching hash says the file is the one that was archived. It
+            # says nothing about whether the proof in it holds -- the hash of
+            # a fabricated stub matches itself perfectly well. Re-running it
+            # is the only thing that distinguishes an archived proof from an
+            # archived file.
+            if replay:
+                result = replay_proof(smt2_path)
+                if not result.get("checked"):
+                    notes.append(
+                        "proof not replayed ({}). The artifact's hash matches, "
+                        "but nothing here re-established that it holds.".format(
+                            result.get("reason"))
+                    )
+                elif result["ok"]:
+                    checks.append(
+                        "Proof replays: {} obligation(s), all unsat".format(result["checks"])
+                    )
+                else:
+                    failures.append("proof does NOT replay -- " + result["reason"])
 
-    print(f"✓ Source integrity verified (SHA-256 matches: {current_hash[:12]}...)")
-    print(f"✓ Verification status at issuance: {'VERIFIED' if data['formal_verification']['verified'] else 'FAILED'}")
-    print(f"✓ Receipt Seal: {data.get('receipt_seal_sha256', 'N/A')[:16]}...")
-    return True
+    for line in checks:
+        print("✓ {}".format(line))
+    for line in notes:
+        # Neither a pass nor a failure: something could not be checked here.
+        # Printing it as either would be the mistake this tool exists to avoid.
+        print("? {}".format(line))
+    for line in failures:
+        print("✗ {}".format(line))
+
+    # Reported last so it cannot be mistaken for a check. It is a record of what
+    # the verifier said at issuance, not something this command re-establishes.
+    status = data.get("formal_verification", {}).get("verified")
+    print("  status at issuance: {} (recorded, not re-verified here)".format(
+        "VERIFIED" if status else "NOT VERIFIED"))
+
+    return {"passed": not failures, "checks": checks, "failures": failures, "notes": notes}
+
+
+def verify_receipt(receipt_file: str, replay: bool = True) -> bool:
+    """Boolean form, for callers that only need pass/fail."""
+    return audit_receipt(receipt_file, replay=replay)["passed"]
 
 
 def main():
