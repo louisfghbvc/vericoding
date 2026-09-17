@@ -485,7 +485,10 @@ def main():
 
         artifact = res["proof_artifact"]
         if artifact["replayable"]:
-            print(f"  Proof       : {artifact['smt2_file']} "
+            # The receipt stores this relative to itself so the two travel
+            # together; resolve it back before printing, or the reader is
+            # handed a bare filename and no directory to find it in.
+            print(f"  Proof       : {resolve_recorded_path(written, artifact['smt2_file'])} "
                   f"({artifact['assertion_count']} assertions)")
             print(f"  Replay with : {artifact['audit_command']}")
         else:
