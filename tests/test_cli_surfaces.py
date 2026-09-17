@@ -9,6 +9,7 @@ existed. The library was correct and the report was not.
 """
 
 import json
+import os
 import sys
 
 import pytest
@@ -201,6 +202,46 @@ def test_receipt_create_prints_how_to_replay_the_proof(tmp_path, monkeypatch, ca
     assert str(artifact) in out
     assert "7 assertions" in out
     assert "Replay with" in out, "a proof was announced with no way to check it"
+
+
+def test_receipt_create_prints_an_absolute_path_but_stores_a_relative_one(
+        tmp_path, monkeypatch, capsys):
+    """Two contracts pull in opposite directions on the same field, and the
+    obvious way to satisfy either one breaks the other.
+
+    The receipt must *store* the artifact relative to itself, or it audits
+    only on the host that issued it. The CLI must *print* a path the reader
+    can hand to z3, or `Replay with : z3 unit.smt2` names a directory the
+    output never gives. Printing the stored field verbatim satisfies storage
+    and breaks display; storing what is printed does the reverse. Pinning
+    both here means neither can be traded away for the other unnoticed.
+    """
+    source = tmp_path / "unit.dfy"
+    source.write_text("method M() {}\n")
+    artifact = tmp_path / "unit.smt2"
+    artifact.write_text("(assert (> 1 0))\n(check-sat)\n")
+
+    monkeypatch.setattr(receipt_mod.ReceiptGenerator, "_emit_proof_artifact",
+                        lambda self, p: {"path": str(artifact),
+                                         "sha256": receipt_mod.compute_file_sha256(str(artifact)),
+                                         "replayable": True, "assertion_count": 1})
+    monkeypatch.setattr(receipt_mod.DafnyVerifier, "verify",
+                        lambda self, p, **kw: {"verified": True, "status": "PROVED",
+                                               "raw_output": "", "errors": []})
+
+    receipt = tmp_path / "unit.receipt.json"
+    _run(receipt_mod, ["receipt_generator.py", "create", str(source)], monkeypatch)
+    printed = [line for line in capsys.readouterr().out.splitlines()
+               if line.strip().startswith("Proof")][0]
+    shown = printed.split(":", 1)[1].split("(")[0].strip()
+
+    assert os.path.isabs(shown), f"a reader cannot follow {shown!r} from anywhere"
+    assert os.path.exists(shown), f"printed a path that is not there: {shown}"
+
+    stored = json.loads(receipt.read_text())["proof_artifact"]["smt2_file"]
+    assert not os.path.isabs(stored), (
+        f"receipt stores {stored!r}, so it travels only with this host")
+    assert receipt_mod.resolve_recorded_path(str(receipt), stored) == shown
 
 
 def test_env_probe_verifies_rather_than_asking_for_a_version(monkeypatch):
