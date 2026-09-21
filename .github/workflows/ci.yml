@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Every job below exists because something in this repository once shipped
+# broken in exactly that way. A CI step that does not correspond to a defect
+# that actually happened is a step nobody will maintain.
+
+jobs:
+  # The floor declared in pyproject.toml, verified rather than trusted. It
+  # exists because one file uses the walrus operator, and a future edit could
+  # raise the real requirement with nobody noticing until a user on an older
+  # interpreter hits a SyntaxError in a file they did not ask about.
+  syntax:
+    name: compile on python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m py_compile bin/vericoding scripts/*.py
+      - run: python bin/vericoding --help > /dev/null
+
+  guarantees:
+    name: the guarantees hold
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: install z3
+        # The pip wheel provides both the Python bindings and a z3 binary.
+        # Dafny's bundled Z3 is deliberately unused: it is built against a
+        # newer glibc than several target hosts provide, so --solver-path is
+        # the supported path everywhere and CI should exercise what users do.
+        run: |
+          pip install z3-solver pytest
+          echo "VERICODING_Z3=$(python -c 'import shutil; print(shutil.which("z3"))')" >> "$GITHUB_ENV"
+
+      - name: install dafny
+        run: |
+          curl -fsSL -o dafny.zip \
+            https://github.com/dafny-lang/dafny/releases/download/v4.11.0/dafny-4.11.0-x64-ubuntu-22.04.zip
+          unzip -q dafny.zip -d "$HOME/dafny-dist"
+          echo "$HOME/dafny-dist/dafny" >> "$GITHUB_PATH"
+
+      # `env` is a gate, not a banner: it exits non-zero when this host cannot
+      # verify. If it fails here, nothing below means anything.
+      - name: environment can actually verify
+        run: python bin/vericoding env
+
+      - name: pytest, with no skips permitted
+        # conftest.py skips toolchain-dependent tests when no verification can
+        # run. That is right on a developer machine and wrong here: CI installs
+        # the toolchain precisely so those tests execute, and a green run full
+        # of skips would hide the regressions this job exists to catch.
+        run: |
+          set -o pipefail
+          pytest -q -rs --color=no 2>&1 | tee out.txt
+          if grep -qE "^SKIPPED|[0-9]+ skipped" out.txt; then
+            echo "::error::tests skipped despite an installed toolchain"
+            exit 1
+          fi
+
+      # --- Each step below guards one defect that shipped. ---
+
+      - name: pipeline refuses a vacuous specification
+        # It used to run the scorer, print "Spec Confidence: 15.0% [LOW]", and
+        # proceed to verify, compile and issue a cryptographic receipt. The
+        # clause below can never fire, so Dafny proves it honestly and no
+        # verifier flag reports anything -- the scorer was the only guard, and
+        # its verdict was discarded.
+        run: |
+          set -euo pipefail
+          cat > /tmp/vacuous.dfy <<'EOF'
+          method Check(n: int) returns (ok: bool)
+            requires n >= 0
+            ensures n < 0 ==> !ok
+          { ok := true; }
+          EOF
+          if python bin/vericoding pipeline /tmp/vacuous.dfy --reviewed --out /tmp/vout; then
+            echo "::error::pipeline accepted a specification with a clause that cannot fire"
+            exit 1
+          fi
+          test ! -f /tmp/vacuous.receipt.json \
+            || { echo "::error::a receipt was issued for a refused specification"; exit 1; }
+
+      - name: lowering --min-score cannot buy past vacuity
+        run: |
+          set -euo pipefail
+          if python bin/vericoding pipeline /tmp/vacuous.dfy --reviewed --min-score 0 --out /tmp/vout2; then
+            echo "::error::--min-score 0 overrode the vacuity check"
+            exit 1
+          fi
+
+      - name: pipeline stops for human review
+        # Stage 4 of the methodology is a human reading the gap report. A
+        # pipeline that runs end to end without ever stopping does not have
+        # that stage, whatever the documentation says.
+        run: |
+          set -euo pipefail
+          set +e
+          python bin/vericoding pipeline examples/bank_account/bank.dfy --out /tmp/rout
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::pipeline completed without --reviewed; the human gate is not a gate"
+            exit 1
+          fi
+
+      - name: audit replays the proof, and catches a swapped artifact
+        # A matching hash only says the file is the one that was archived. It
+        # says nothing about whether the proof inside it holds. The artifact
+        # this repository shipped with was a five-line stub that re-checked as
+        # `sat`, hashed into the receipt and recorded as replayable.
+        run: |
+          set -euo pipefail
+          python bin/vericoding pipeline examples/bank_account/bank.dfy --reviewed --out /tmp/bout
+          python bin/vericoding audit examples/bank_account/bank.receipt.json
+
+          cp examples/bank_account/bank.smt2 /tmp/real.smt2
+          printf '; stub\n(set-logic ALL)\n(check-sat)\n' > examples/bank_account/bank.smt2
+          if python bin/vericoding audit examples/bank_account/bank.receipt.json; then
+            echo "::error::audit accepted an artifact that was swapped for a stub"
+            cp /tmp/real.smt2 examples/bank_account/bank.smt2
+            exit 1
+          fi
+          cp /tmp/real.smt2 examples/bank_account/bank.smt2
+
+      - name: install.sh refuses to clobber a real directory
+        # It used to rm -rf the target path. A user with their own notes there
+        # lost them silently, and `set -e` gave no protection because rm -rf
+        # succeeded -- it did what it was told.
+        run: |
+          set -euo pipefail
+          FAKE_HOME=$(mktemp -d)
+          mkdir -p "$FAKE_HOME/.claude/skills/vericoding"
+          echo "user data" > "$FAKE_HOME/.claude/skills/vericoding/NOTES.md"
+          set +e
+          HOME="$FAKE_HOME" VERICODING_INSTALL_SELFTEST=1 bash install.sh
+          code=$?
+          set -e
+          test -f "$FAKE_HOME/.claude/skills/vericoding/NOTES.md" \
+            || { echo "::error::install.sh destroyed a pre-existing user directory"; exit 1; }
+          test "$code" -ne 0 \
+            || { echo "::error::install.sh reported success while refusing to link"; exit 1; }
+
+      - name: committed artifacts match a fresh run
+        # Drift means the repository ships a proof of something other than the
+        # specification beside it. Only .smt2 is checked: receipts carry a
+        # timestamp and are reproducible in content, not byte-for-byte.
+        run: |
+          if ! git diff --quiet -- 'examples/**/*.smt2'; then
+            echo "::error::committed .smt2 artifacts differ from a fresh generation"
+            git diff --stat -- 'examples/**/*.smt2'
+            exit 1
+          fi

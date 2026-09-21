@@ -1,7 +1,7 @@
 {
   "schema_version": "vericoding.proof.v1",
-  "timestamp_utc": "2026-09-15T09:36:02Z",
-  "source_file": "/home/scratch.louiliu_vlsi_1/sideProject/vericoding/examples/bank_account/bank.dfy",
+  "timestamp_utc": "2026-09-16T07:01:42Z",
+  "source_file": "bank.dfy",
   "hashes": {
     "natural_language_intent_sha256": "e5984b90e1a91a7972608b944cd12a724033ff00ff1084bd59dabe5c64c8312f",
     "dafny_source_sha256": "0713ac4615d59da3f4e20605e9fb26fdcf7e3711a41fa26a1fa6298316885fd5",
@@ -9,7 +9,7 @@
   },
   "formal_verification": {
     "verified": true,
-    "duration_seconds": 1.184,
+    "duration_seconds": 1.357,
     "solver_backend": "Z3 / SMT-LIB2",
     "errors_count": 0,
     "diagnostics": []
@@ -31,11 +31,11 @@
     "human_review_attested": true
   },
   "proof_artifact": {
-    "smt2_file": "examples/bank_account/bank.smt2",
+    "smt2_file": "bank.smt2",
     "replayable": true,
     "reason": null,
     "assertion_count": 294,
     "audit_command": "z3 bank.smt2"
   },
-  "receipt_seal_sha256": "e6c065bb3a6cb015c765d0f8cb3e2fb751c4451c23da4f01ef784b8be52c6d27"
+  "receipt_seal_sha256": "2440d267189d0739892e37cdeb91c32102929c4a2d8ee842509e3f9b9ea9202f"
 }

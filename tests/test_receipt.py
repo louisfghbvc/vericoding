@@ -31,6 +31,86 @@ def test_audit_accepts_an_untampered_receipt():
     assert verify_receipt(_clean_receipt()) is True
 
 
+def test_committed_receipt_is_portable(tmp_path, monkeypatch):
+    """A receipt that only audits in one directory is not a portable receipt.
+
+    `source_file` used to be recorded absolute, so the committed receipt
+    resolved on exactly one machine and one checkout. Everywhere else the
+    auditor reported "source file not found" -- which a reader takes as
+    tampering, not as a path that was never portable in the first place.
+
+    The recorded-path assertions come first on purpose: they fail on any host,
+    including one that happens to have another checkout at the absolute path
+    the receipt was issued with. A green audit there proves nothing.
+    """
+    data = json.loads(open(_clean_receipt()).read())
+
+    assert not os.path.isabs(data["source_file"]), (
+        "receipt records an absolute source path, so it audits only on the "
+        "host that issued it: {}".format(data["source_file"])
+    )
+    smt2 = data["proof_artifact"]["smt2_file"]
+    assert smt2 is None or not os.path.isabs(smt2), (
+        "receipt records an absolute proof-artifact path: {}".format(smt2)
+    )
+
+    receipt = os.path.abspath(_clean_receipt())
+    monkeypatch.chdir(tmp_path)
+    assert verify_receipt(receipt) is True
+
+
+def test_generate_records_paths_relative_to_the_receipt(tmp_path, monkeypatch, toolchain):
+    """Issued receipts travel with the tree they describe, not with a cwd."""
+    import shutil
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    shutil.copy("examples/bank_account/bank.dfy", str(tree / "bank.dfy"))
+
+    receipt_file = tree / "bank.receipt.json"
+    res = ReceiptGenerator().generate(
+        str(tree / "bank.dfy"),
+        output_receipt_path=str(receipt_file),
+        dump_smt=False,
+    )
+    assert res["source_file"] == "bank.dfy"
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert verify_receipt(str(receipt_file)) is True
+
+
+def test_audit_still_resolves_what_older_receipts_recorded(tmp_path, monkeypatch):
+    """Backward compatibility, because the alternative is a false alarm.
+
+    Receipts already issued record an absolute source path and a cwd-relative
+    artifact path. Refusing to resolve those would report an honest, sealed
+    receipt as a failed audit -- the same wrong answer this change exists to
+    remove, pointed the other way.
+    """
+    from scripts.receipt_generator import resolve_recorded_path
+
+    home = tmp_path / "sub"
+    home.mkdir()
+    receipt = home / "x.receipt.json"
+    receipt.write_text("{}")
+
+    beside = home / "beside.dfy"
+    beside.write_text("x")
+    assert resolve_recorded_path(str(receipt), "beside.dfy") == str(beside)
+
+    absolute = tmp_path / "absolute.dfy"
+    absolute.write_text("y")
+    assert resolve_recorded_path(str(receipt), str(absolute)) == str(absolute)
+
+    cwd_relative = tmp_path / "cwdrel.dfy"
+    cwd_relative.write_text("z")
+    monkeypatch.chdir(tmp_path)
+    assert os.path.samefile(
+        resolve_recorded_path(str(receipt), "cwdrel.dfy"), str(cwd_relative))
+
+
 def test_audit_rejects_a_forged_seal(tmp_path):
     """The seal used to be printed but never recomputed.
 
@@ -64,8 +144,12 @@ def test_audit_rejects_a_swapped_proof_artifact(tmp_path):
     """
     import shutil
 
+    from scripts.receipt_generator import resolve_recorded_path
+
     data = json.loads(open(_clean_receipt()).read())
-    artifact = data["proof_artifact"]["smt2_file"]
+    # Recorded relative to the receipt, so resolve it the way the auditor does
+    # rather than assuming the suite runs from the repository root.
+    artifact = resolve_recorded_path(_clean_receipt(), data["proof_artifact"]["smt2_file"])
     backup = tmp_path / "artifact.bak"
     shutil.copy(artifact, str(backup))
     try:
