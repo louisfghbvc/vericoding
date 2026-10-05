@@ -97,6 +97,22 @@ Read the gap report, not the percentage. `✓` established, `⚠` weak, `✗`
 defect, **`?` not analysed — which is not a pass.** Clauses the analyser could
 not parse were neither credited nor cleared; read those yourself.
 
+**Three outcomes, not a number.** The vacuity analysis either ran, could not
+run, or failed, and the report says which:
+
+| outcome | headline | `score` exit |
+| :--- | :--- | :--- |
+| analysed | `Spec Confidence : NN% [BAND]` | 0 |
+| could-not-analyse | `Spec Confidence : NOT ESTABLISHED` + the reason and the install command | 2 |
+| failed | `NOT ESTABLISHED`, with the error the analysis raised | 2 |
+
+The analysis needs the z3 **Python bindings** (`pip install z3-solver`) —
+not the same thing as the `z3` executable on `PATH`. Without them there is no
+score to read: a partial figure is still printed, labelled as a floor computed
+without the check, and it is not comparable to a score whose check did run.
+Treating "I could not check this" as "this spec scores badly" is the one
+report this tool must never produce.
+
 ### What the analyser can read
 
 The satisfiability check runs on a deliberately small expression fragment.
@@ -206,6 +222,12 @@ Runs 3 through 7. It refuses any specification containing a vacuous clause,
 and any scoring below `--min-score` (default 60). `--force` overrides that and
 writes the override into the receipt. Without `--reviewed` it stops at stage 4
 and exits 3.
+
+It also refuses, before any threshold is applied, when the vacuity analysis
+could not run — naming the missing dependency and the command that installs
+it. `--force` does **not** override that one: it means "I have read these
+findings and accept them", and an analysis that never ran produced no
+findings to read.
 
 ---
 

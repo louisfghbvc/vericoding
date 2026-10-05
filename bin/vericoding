@@ -59,6 +59,21 @@ def cmd_score(args):
         print(json.dumps(res, indent=2))
     else:
         print(spec_scorer.format_cli_report(res))
+
+    # Three outcomes, three exit codes -- the same split `audit` already
+    # makes, and for the same reason. "scored below the threshold" is a
+    # judgement about the specification; "could not be established" is a
+    # statement about this machine. Collapsing them into one code is how a
+    # missing package comes to look like a bad spec.
+    if not res.get("score_complete", True):
+        vacuity = res["vacuity_analysis"]
+        print("\n[Unanalysed] " + str(vacuity.get("reason")), file=sys.stderr)
+        if vacuity.get("remedy"):
+            print("             Install it with:  " + vacuity["remedy"], file=sys.stderr)
+        print("             No threshold was applied: there is no score to compare.",
+              file=sys.stderr)
+        sys.exit(2)
+
     if res["overall_score"] < args.threshold:
         print(f"\n[Warning] Spec score ({res['overall_score']}%) below threshold ({args.threshold}%). Review recommended.", file=sys.stderr)
 
@@ -124,7 +139,10 @@ def cmd_pipeline(args):
     import spec_scorer
     scorer = spec_scorer.SpecScorer(args.file)
     res = scorer.analyze()
-    print(f"  Spec Confidence: {res['overall_score']}% [{res['confidence_level']}]")
+    if res.get("score_complete", True):
+        print(f"  Spec Confidence: {res['overall_score']}% [{res['confidence_level']}]")
+    else:
+        print("  Spec Confidence: NOT ESTABLISHED (the vacuity analysis could not run)")
 
     # The score used to be printed here and never read again. That made the
     # scorer decorative in the one command where it matters most: a
@@ -149,6 +167,37 @@ def cmd_pipeline(args):
                 len(vacuous), "; ".join(vacuous[:3]) + ("; ..." if len(vacuous) > 3 else "")
             )
         )
+
+    # An unrun vacuity check is not a low score, and must not be compared to
+    # --min-score at all. Refusing is the conservative direction and the only
+    # one consistent with this tool's thesis: never claim more than was
+    # established. Proceeding would put a cryptographic receipt on a
+    # specification whose vacuity nobody checked -- exactly the shape the
+    # spec gate exists to stop -- and reporting the partial number instead
+    # tells the author their specification is poor when the truth is that
+    # this machine is missing a package.
+    #
+    # Deliberately ahead of --force, and deliberately not overridable by it.
+    # --force means "I have read these findings about my spec and accept
+    # them". Here there are no findings; there is no evidence either way.
+    # Whether to offer an explicit --allow-unanalysed escape hatch is an
+    # owner decision, recorded in the task notes and not taken here.
+    #
+    # Established defects still come first: the vacuous-clause blocker above
+    # is decided by reading, needs no solver, and names something real, so a
+    # spec that trips both is told about the clause rather than the package.
+    if not blockers and not res.get("score_complete", True):
+        vacuity = res["vacuity_analysis"]
+        print("  ✗ The vacuity analysis could not run, so this specification was")
+        print("    NOT checked. That is not the same as scoring badly, and the")
+        print("    pipeline will not put a proof receipt on an unchecked spec.")
+        print(f"\n    Reason:  {vacuity.get('reason')}")
+        if vacuity.get("remedy"):
+            print(f"    Fix it:  {vacuity['remedy']}")
+        print("\n  Then re-run this command. No score was compared to --min-score:")
+        print("  there is no score to compare.")
+        sys.exit(1)
+
     if res["overall_score"] < args.min_score:
         blockers.append(
             "score {}% is below the --min-score threshold of {}%".format(

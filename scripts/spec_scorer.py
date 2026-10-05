@@ -19,8 +19,53 @@ from typing import Dict, List, Any, Optional
 
 try:
     import z3
-except ImportError:
+    Z3_IMPORT_ERROR = None
+except ImportError as _z3_import_error:       # pragma: no cover - env dependent
     z3 = None
+    Z3_IMPORT_ERROR = str(_z3_import_error)
+
+
+# The vacuity analysis has THREE outcomes, and the third one is the point.
+#
+# "The check ran and found nothing wrong" and "the check could not run" are
+# different facts about a specification, and folding the second into the
+# numeric score states the first. Measured on examples/bank_account/bank.dfy
+# before this distinction existed:
+#
+#     with the z3 bindings     84.0% [MODERATE]
+#     without them             72.0% [MODERATE]   "z3 python package not found"
+#
+# Identical spec, identical clauses. The twelve points are a missing package
+# on the reader's machine, and the pipeline's default --min-score then turns
+# that into "your specification is poor". It is not; the tool could not check
+# it. The number is still computed -- it is a conservative floor and the
+# monotonicity properties around it still hold -- but it is no longer
+# presented as a confidence verdict, and the gate refuses rather than
+# comparing it to a threshold that assumes the check ran.
+VACUITY_ANALYSED = "analysed"
+VACUITY_UNAVAILABLE = "could-not-analyse"
+VACUITY_FAILED = "failed"
+
+# The bindings, not the executable. `z3 --version` on PATH says nothing about
+# whether `import z3` works, and naming the wrong one sends the reader to
+# install something they already have.
+Z3_INSTALL_HINT = "pip install z3-solver"
+
+# Sits where HIGH / MODERATE / LOW sit, and deliberately is not one of them.
+CONFIDENCE_NOT_ESTABLISHED = "NOT ESTABLISHED"
+
+
+def vacuity_engine_status() -> Dict[str, Any]:
+    """Whether the vacuity analysis can run at all, and if not, why."""
+    if z3 is not None:
+        return {"status": VACUITY_ANALYSED, "reason": None, "remedy": None}
+    detail = " ({})".format(Z3_IMPORT_ERROR) if Z3_IMPORT_ERROR else ""
+    return {
+        "status": VACUITY_UNAVAILABLE,
+        "reason": "the z3 Python bindings are not installed"
+                  ", so no vacuity check could run" + detail,
+        "remedy": Z3_INSTALL_HINT,
+    }
 
 
 CLAUSE_KEYWORDS = ("requires", "ensures", "modifies", "reads", "decreases", "invariant")
@@ -251,6 +296,8 @@ class SpecScorer:
             "overall_score": 0,
             "confidence_level": "LOW",
             "summary_gaps": [],
+            "vacuity_analysis": {"status": VACUITY_ANALYSED, "reason": None, "remedy": None},
+            "score_complete": True,
         }
 
         if not self.parser.methods:
@@ -266,6 +313,22 @@ class SpecScorer:
         avg_score = round(total_score / len(self.parser.methods), 1)
         results["overall_score"] = avg_score
 
+        # One unchecked method is enough: the file-level number averages over
+        # methods, so a single unanalysed one makes the average an answer to a
+        # question nobody asked.
+        results["vacuity_analysis"] = self._file_vacuity_state(results["methods"])
+        results["score_complete"] = (
+            results["vacuity_analysis"]["status"] == VACUITY_ANALYSED
+        )
+
+        if not results["score_complete"]:
+            # Not a band. HIGH/MODERATE/LOW all mean "this is how much
+            # confidence the analysis established", and no analysis ran. The
+            # label is the same words the report headline uses, so a reader
+            # who greps either one finds the same state.
+            results["confidence_level"] = CONFIDENCE_NOT_ESTABLISHED
+            return results
+
         if avg_score >= HIGH_CONFIDENCE_MIN:
             results["confidence_level"] = "HIGH"
         elif avg_score >= MODERATE_CONFIDENCE_MIN:
@@ -274,6 +337,27 @@ class SpecScorer:
             results["confidence_level"] = "LOW"
 
         return results
+
+    @staticmethod
+    def _file_vacuity_state(methods: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Roll the per-method outcomes up into one state for the file."""
+        statuses = [m.get("vacuity_status", VACUITY_ANALYSED) for m in methods]
+
+        if VACUITY_UNAVAILABLE in statuses:
+            return vacuity_engine_status()
+
+        if VACUITY_FAILED in statuses:
+            failed = statuses.count(VACUITY_FAILED)
+            return {
+                "status": VACUITY_FAILED,
+                "reason": "the vacuity analysis raised an error on {} of {} "
+                          "method(s); see the per-clause notes for the "
+                          "message".format(failed, len(statuses)),
+                # Nothing to install: the engine is present and broke.
+                "remedy": None,
+            }
+
+        return {"status": VACUITY_ANALYSED, "reason": None, "remedy": None}
 
     def _analyze_method(self, method: Dict[str, Any]) -> Dict[str, Any]:
         req_count = len(method["requires"])
@@ -309,6 +393,9 @@ class SpecScorer:
                 "live_ensures": [],
                 "vacuous_clauses": list(method["ensures"]),
                 "unanalysed_clauses": [],
+                # Established by reading the body, not by a solver: the
+                # verdict stands whether or not the bindings are installed.
+                "vacuity_status": VACUITY_ANALYSED,
             }
 
         # Vacuity first, because it decides what the other counts MEAN. The
@@ -317,6 +404,7 @@ class SpecScorer:
         # score. Only live clauses may earn credit.
         smt_check = self._check_smt_vacuity(method)
         ens_check = self._check_ensures_vacuity(method)
+        vacuity_status = self._vacuity_status(smt_check, ens_check)
         live_ensures = ens_check["live"]
         vacuous_ensures = ens_check["vacuous"]
         unanalysed_ensures = ens_check["unanalysed"]
@@ -349,6 +437,7 @@ class SpecScorer:
                 "unanalysed_clauses": [
                     e["clause"] if isinstance(e, dict) else e for e in unanalysed_ensures
                 ],
+                "vacuity_status": vacuity_status,
             }
 
         # 1. Check preconditions
@@ -516,7 +605,24 @@ class SpecScorer:
             "unanalysed_clauses": [
                 u["clause"] if isinstance(u, dict) else u for u in unanalysed_ensures
             ],
+            "vacuity_status": vacuity_status,
         }
+
+    @staticmethod
+    def _vacuity_status(smt_check: Dict[str, Any], ens_check: Dict[str, Any]) -> str:
+        """Which of the three outcomes this method's vacuity analysis reached.
+
+        A clause outside the supported fragment is NOT one of these: the
+        engine ran and answered, the answer just does not cover that clause.
+        That is a finding about the specification, already reported per clause
+        and already capped below HIGH. Only the engine being absent or
+        throwing means the question went unasked.
+        """
+        if smt_check.get("unavailable"):
+            return VACUITY_UNAVAILABLE
+        if smt_check.get("failed") or ens_check.get("engine_failed"):
+            return VACUITY_FAILED
+        return VACUITY_ANALYSED
 
     # ------------------------------------------------------------------
     # Vacuity analysis
@@ -705,7 +811,9 @@ class SpecScorer:
     def _check_smt_vacuity(self, method: Dict[str, Any]) -> Dict[str, Any]:
         """Shape A: are the preconditions jointly satisfiable?"""
         if not z3:
-            return {"analysed": False, "note": "z3 python package not found"}
+            engine = vacuity_engine_status()
+            return {"analysed": False, "unavailable": True,
+                    "note": "{} — {}".format(engine["reason"], engine["remedy"])}
 
         # `requires false` needs no solver and no parser.
         for req in method["requires"]:
@@ -747,11 +855,14 @@ class SpecScorer:
                     "unparsed": unparsed_total,
                     "parsed_count": len(solver.assertions())}
         except Exception as ex:
-            return {"analysed": False, "note": str(ex)}
+            # The engine was there and threw. Different fact from "not
+            # installed", and the remedy is different too -- nothing to
+            # install, something to report.
+            return {"analysed": False, "failed": True, "note": str(ex)}
 
     def _check_ensures_vacuity(self, method: Dict[str, Any]) -> Dict[str, Any]:
         """Shape B: can each postcondition's antecedent ever hold?"""
-        result = {"vacuous": [], "unanalysed": [], "live": []}
+        result = {"vacuous": [], "unanalysed": [], "live": [], "engine_failed": False}
 
         for ens in method["ensures"]:
             body = ens.strip()
@@ -829,6 +940,7 @@ class SpecScorer:
                 else:
                     result["live"].append(ens)
             except Exception as ex:
+                result["engine_failed"] = True
                 result["unanalysed"].append({"clause": ens, "why": str(ex)})
 
         return result
@@ -840,7 +952,25 @@ def format_cli_report(res: Dict[str, Any]) -> str:
     lines.append(f"          SMT SPEC SCORING & GAP ANALYSIS         ")
     lines.append("==================================================")
     lines.append(f"Target Spec File : {res['file']}")
-    lines.append(f"Spec Confidence  : {res['overall_score']}% [{res['confidence_level']}]")
+
+    vacuity = res.get("vacuity_analysis") or {}
+    if res.get("score_complete", True):
+        lines.append(f"Spec Confidence  : {res['overall_score']}% [{res['confidence_level']}]")
+    else:
+        # Deliberately NOT "{n}% [LOW]". The number below the headline is a
+        # floor computed with the vacuity check missing, and printing it where
+        # a reader reads a verdict says the specification was judged. It was
+        # not; it was not checked.
+        lines.append("Spec Confidence  : {} "
+                     "(the vacuity analysis could not run)".format(
+                         res.get("confidence_level", CONFIDENCE_NOT_ESTABLISHED)))
+        lines.append(f"  Reason         : {vacuity.get('reason')}")
+        if vacuity.get("remedy"):
+            lines.append(f"  Install        : {vacuity['remedy']}")
+        lines.append("  Partial figure : {}% — a floor computed WITHOUT the vacuity "
+                     "check.".format(res["overall_score"]))
+        lines.append("                   Not a quality judgement, and not comparable")
+        lines.append("                   to a score whose vacuity check did run.")
     lines.append("--------------------------------------------------")
 
     ICONS = {

@@ -69,11 +69,18 @@ The spec gate refuses any specification containing a vacuous clause, and any
 scoring below `--min-score` (default 60). `--force` overrides it and the
 override is written into the receipt.
 
+It also refuses when the vacuity analysis **could not run at all** — that
+needs the z3 *Python bindings* (`pip install z3-solver`), a separate thing
+from the z3 executable. That refusal is a third state, not a low score: the
+message names the missing dependency, no number is compared to `--min-score`,
+and `--force` does not override it, because `--force` means "I have read
+these findings and accept them" and in this case there are no findings.
+
 ### 3. Step-by-Step Sub-workflows
 
 | Command | Purpose |
 | :--- | :--- |
-| `vericoding score <file.dfy>` | Check vacuity, consistency & generate Spec Confidence % + Gap Report |
+| `vericoding score <file.dfy>` | Check vacuity, consistency & generate Spec Confidence % + Gap Report (exits `0` when it scored, `2` when the vacuity analysis could not run) |
 | `vericoding verify <file.dfy>` | Run Dafny & Z3 formal verification with structured diagnostic hints |
 | `vericoding compile <file.dfy> --target [py\|go\|js\|cs]` | Compile verified Dafny to a target language — see the caveat below |
 | `vericoding receipt <file.dfy> --intent "..."` | Generate SMT-LIB2 proof artifact + cryptographic JSON receipt |
